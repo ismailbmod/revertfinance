@@ -1,6 +1,5 @@
-
 import cron from 'node-cron';
-import { monitorPositions } from './src/lib/monitor';
+import { monitorPositions } from '../src/lib/monitor';
 
 console.log('--- Professional LP Bot Scheduler Started ---');
 console.log('Monitoring frequency: Every 30 minutes');

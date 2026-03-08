@@ -7,7 +7,7 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "bot": "npx tsx --env-file=.env.local scheduler.ts"
+    "bot": "npx tsx --env-file=.env.local scripts/scheduler.ts"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.98.0",
