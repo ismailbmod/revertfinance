@@ -63,25 +63,54 @@ export async function GET() {
 
         // 2. Fetch Prices via CCXT (Binance)
         const exchange = new ccxt.binance();
-        const prices: Record<string, number> = { 'USDC': 1, 'USDT': 1, 'DAI': 1, 'USDC.e': 1 };
+        const prices: Record<string, number> = {
+            'USDC': 1,
+            'USDT': 1,
+            'DAI': 1,
+            'USDC.E': 1,
+            'USDE': 1,
+            'PYUSD': 1
+        };
 
         try {
-            const tickers = await exchange.fetchTickers(['ETH/USDT', 'BTC/USDT', 'MATIC/USDT']);
-            prices['ETH'] = tickers['ETH/USDT']?.last || 0;
-            prices['WETH'] = tickers['ETH/USDT']?.last || 0;
-            prices['WBTC'] = tickers['BTC/USDT']?.last || 0;
-            prices['MATIC'] = tickers['MATIC/USDT']?.last || 0;
-            console.log(`Prices fetched: ETH=${prices['ETH']}, WBTC=${prices['WBTC']}`);
+            const tickers = await exchange.fetchTickers(['ETH/USDT', 'BTC/USDT', 'MATIC/USDT', 'SOL/USDT']);
+            const ethPrice = tickers['ETH/USDT']?.last || 0;
+            const btcPrice = tickers['BTC/USDT']?.last || 0;
+            const maticPrice = tickers['MATIC/USDT']?.last || 0;
+
+            prices['ETH'] = ethPrice;
+            prices['WETH'] = ethPrice;
+            prices['BTC'] = btcPrice;
+            prices['WBTC'] = btcPrice;
+            prices['MATIC'] = maticPrice;
+            prices['WMATIC'] = maticPrice;
+
+            console.log(`Prices fetched: ETH=${ethPrice}, BTC=${btcPrice}, MATIC=${maticPrice}`);
         } catch (e) {
             console.error('Price fetch failed from Binance:', e instanceof Error ? e.message : e);
         }
 
-        // 3. Attach USD Values
-        const balancesWithUSD = allBalances.map(b => ({
-            ...b,
-            price: prices[b.symbol] || 0,
-            balanceUSD: (parseFloat(b.balance) * (prices[b.symbol] || 0))
-        }));
+        // 3. Attach USD Values with fuzzy/case-insensitive matching
+        const balancesWithUSD = allBalances.map(b => {
+            const symbol = b.symbol.toUpperCase();
+            let price = 0;
+
+            if (prices[symbol]) {
+                price = prices[symbol];
+            } else if (symbol.includes('BTC')) {
+                price = prices['BTC'] || 0;
+            } else if (symbol.includes('ETH')) {
+                price = prices['ETH'] || 0;
+            } else if (symbol.includes('USDC') || symbol.includes('USDT') || symbol.includes('DAI')) {
+                price = 1;
+            }
+
+            return {
+                ...b,
+                price: price,
+                balanceUSD: (parseFloat(b.balance) * price)
+            };
+        });
 
         return NextResponse.json(balancesWithUSD);
     } catch (error: any) {

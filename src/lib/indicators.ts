@@ -88,3 +88,26 @@ export function detectRegime(ema20: number, ema50: number, adx: number): 'trend'
     }
     return 'neutral';
 }
+
+export function calculateRSI(prices: number[], period: number): number[] {
+    const rsi: number[] = [];
+    const gains: number[] = [];
+    const losses: number[] = [];
+
+    for (let i = 1; i < prices.length; i++) {
+        const difference = prices[i] - prices[i - 1];
+        gains.push(Math.max(0, difference));
+        losses.push(Math.max(0, -difference));
+    }
+
+    let avgGain = gains.slice(0, period).reduce((a, b) => a + b) / period;
+    let avgLoss = losses.slice(0, period).reduce((a, b) => a + b) / period;
+
+    for (let i = period; i < gains.length; i++) {
+        rsi.push(100 - (100 / (1 + (avgGain / (avgLoss || 1)))));
+        avgGain = (avgGain * (period - 1) + gains[i]) / period;
+        avgLoss = (avgLoss * (period - 1) + losses[i]) / period;
+    }
+
+    return rsi;
+}

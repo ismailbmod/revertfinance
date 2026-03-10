@@ -1,10 +1,10 @@
 "use client"
 
 import React, { useState, useEffect } from 'react';
-import { TrendingUp, Activity, Bell, Settings, ArrowUpRight, ArrowDownRight, RefreshCw } from 'lucide-react';
+import { TrendingUp, Activity, Bell, Settings, ArrowUpRight, ArrowDownRight, RefreshCw, Zap } from 'lucide-react';
 import {
     AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
-    BarChart, Bar, Cell
+    BarChart, Bar, Cell, ComposedChart, ReferenceArea, ReferenceLine
 } from 'recharts';
 import { formatDistanceToNow } from 'date-fns';
 
@@ -39,7 +39,17 @@ export default function Dashboard() {
     const [signals, setSignals] = useState<any[]>([]);
     const [positions, setPositions] = useState<Position[]>([]);
     const [balances, setBalances] = useState<any[]>([]);
-    const [selectedPair, setSelectedPair] = useState('ZEC/USDT');
+    const [selectedChainId, setSelectedChainId] = useState(1);
+    const [topPools, setTopPools] = useState<any[]>([]);
+    const [selectedPoolAddress, setSelectedPoolAddress] = useState('');
+    const [selectedPair, setSelectedPair] = useState('ETH/USDC');
+    const [isWalletLoading, setIsWalletLoading] = useState(false);
+    const [isAnalyzing, setIsAnalyzing] = useState(false);
+    const [isScanning, setIsScanning] = useState(false);
+    const [isDetectingHighYield, setIsDetectingHighYield] = useState(false);
+    const [highYieldPools, setHighYieldPools] = useState<any[]>([]);
+    const [alphaSniperResults, setAlphaSniperResults] = useState<any[]>([]);
+    const [isSniping, setIsSniping] = useState(false);
     const [settings, setSettings] = useState<{
         wallets: string[];
         risk_profile: string;
@@ -57,7 +67,30 @@ export default function Dashboard() {
         fetchSignals();
         fetchPositions();
         fetchBalances();
+        fetchPools(selectedChainId);
     }, []);
+
+    useEffect(() => {
+        fetchPools(selectedChainId);
+    }, [selectedChainId]);
+
+    const fetchPools = async (chainId: number) => {
+        try {
+            const res = await fetch(`/api/pools?chainId=${chainId}`);
+            const data = await res.json();
+            if (!data.error) {
+                setTopPools(data);
+                // Set first pool as default if available
+                if (data.length > 0 && !selectedPoolAddress) {
+                    const first = data[0];
+                    setSelectedPair(`${first.token0.symbol}/${first.token1.symbol}`);
+                    setSelectedPoolAddress(first.id);
+                }
+            }
+        } catch (e) {
+            console.error(e);
+        }
+    };
 
     const fetchSettings = async () => {
         const res = await fetch('/api/settings');
@@ -84,9 +117,16 @@ export default function Dashboard() {
     };
 
     const fetchBalances = async () => {
-        const res = await fetch('/api/balances');
-        const data = await res.json();
-        if (!data.error) setBalances(data);
+        setIsWalletLoading(true);
+        try {
+            const res = await fetch('/api/balances');
+            const data = await res.json();
+            if (!data.error) setBalances(data);
+        } catch (e) {
+            console.error(e);
+        } finally {
+            setIsWalletLoading(false);
+        }
     };
 
     const handleUpdateSetting = async (key: string, value: any) => {
@@ -102,33 +142,148 @@ export default function Dashboard() {
     const totalLPUSD = positions.reduce((sum, p) => sum + (p.valueUSD || 0), 0);
     const totalPortfolioUSD = totalWalletUSD + totalLPUSD;
 
-    const triggerAnalysis = async (posOverride?: Position) => {
-        setIsRefreshing(true);
-        const pair = posOverride ? posOverride.pair : selectedPair;
-        const chainId = posOverride ? posOverride.chainId : 1;
-        const poolAddress = posOverride ? posOverride.poolAddress : '0x...';
+    const [scanLimit, setScanLimit] = useState(3);
+    const formatPrice = (p: number) => {
+        if (!p) return '0.00';
+        if (p < 0.0001) return p.toFixed(8);
+        if (p < 0.01) return p.toFixed(6);
+        return p.toFixed(4);
+    };
 
-        if (posOverride) setSelectedPair(posOverride.pair);
+    const triggerAnalysis = async (posOverride?: Position | any, silent: boolean = false) => {
+        if (!silent) setIsAnalyzing(true);
+        else setIsRefreshing(true);
+
+        const pair = posOverride ? posOverride.pair : selectedPair;
+        const chainId = posOverride ? posOverride.chainId : selectedChainId;
+        const poolAddress = posOverride ? posOverride.poolAddress || posOverride.id : selectedPoolAddress;
+
+        if (posOverride) {
+            setSelectedPair(posOverride.pair);
+            setSelectedChainId(posOverride.chainId);
+            setSelectedPoolAddress(posOverride.poolAddress || posOverride.id);
+        }
 
         try {
             const res = await fetch('/api/analyze', {
                 method: 'POST',
                 body: JSON.stringify({
                     pool: { symbol: pair, chainId, poolAddress },
-                    riskProfile: settings.risk_profile
+                    riskProfile: settings.risk_profile,
+                    silent
                 })
             });
             const data = await res.json();
             if (data.result) {
                 setLastAnalysis(data.result);
-                fetchSignals();
-                fetchPositions();
-                fetchBalances();
+                if (!silent) {
+                    fetchSignals();
+                    fetchPositions();
+                    fetchBalances();
+                }
+            } else if (!silent) {
+                setLastAnalysis(null);
+                alert(`Analysis unavailable: Price oracle not found on Binance for this pair.`);
             }
         } catch (e) {
             console.error(e);
         }
+        setIsAnalyzing(false);
         setIsRefreshing(false);
+    };
+
+
+    // Phase 2: Market Scan
+    const runMarketScan = async () => {
+        setIsScanning(true);
+        try {
+            const res = await fetch('/api/scan', {
+                method: 'POST',
+                body: JSON.stringify({
+                    riskProfile: settings.risk_profile,
+                    limit: scanLimit
+                })
+            });
+            const data = await res.json();
+            if (data.success && data.topopportunities && data.topopportunities.length > 0) {
+                const formattedSignals = data.topopportunities.map((opp: any, idx: number) => ({
+                    id: `scan-${Date.now()}-${idx}`,
+                    type: 'scan',
+                    asset_pair: opp.pool,
+                    created_at: new Date().toISOString(),
+                    message: `Market Scan. Regime: ${opp.analysis.indicators?.regime?.toUpperCase() || 'N/A'}. Strategy: ${opp.analysis.recommendation?.strategy || 'N/A'}`,
+                    data: {
+                        currentPrice: opp.analysis.currentPrice,
+                        confidence: opp.confidence,
+                        chainId: opp.chainId,
+                        poolAddress: opp.poolAddress,
+                        ...opp.analysis
+                    }
+                }));
+                setSignals(formattedSignals);
+            } else if (data.success) {
+                alert("Scan complete! No high-yield opportunities met the current validation criteria on the scanned networks.");
+            } else {
+                alert(`Scan failed: ${data.error || 'Unknown error'}`);
+            }
+        } catch (error) {
+            console.error('Scan failed:', error);
+            alert("A network error occurred during the market scan. Please try again.");
+        } finally {
+            setIsScanning(false);
+        }
+    };
+
+    const runHighYieldDetection = async () => {
+        setIsDetectingHighYield(true);
+        try {
+            const res = await fetch('/api/high-yield', {
+                method: 'POST'
+            });
+            const data = await res.json();
+            if (data.success && data.highYieldPools) {
+                setHighYieldPools(data.highYieldPools);
+                if (data.highYieldPools.length === 0) {
+                    alert("No High Yield (0.3%+) opportunities found at this time with TVL > 5M.");
+                }
+            }
+        } catch (error) {
+            console.error('High yield detection failed:', error);
+            alert("A network error occurred during the high yield detection.");
+        } finally {
+            setIsDetectingHighYield(false);
+        }
+    };
+
+    const runAlphaSniperScan = async () => {
+        setIsSniping(true);
+        try {
+            const res = await fetch('/api/alpha-sniper', { method: 'POST' });
+            const data = await res.json();
+            if (data.success) {
+                setAlphaSniperResults(data.opportunities);
+            } else {
+                alert(data.error || 'Alpha Sniper scan failed');
+            }
+        } catch (error) {
+            console.error('Sniper Scan Error:', error);
+            alert('Failed to trigger Alpha Sniper');
+        } finally {
+            setIsSniping(false);
+        }
+    };
+
+    const handleSignalClick = (signal: any) => {
+        const chainId = signal.data?.chainId || signal.metadata?.chainId || selectedChainId;
+        const poolAddress = signal.data?.poolAddress || '';
+
+        setSelectedChainId(chainId);
+        setSelectedPair(signal.asset_pair);
+        if (poolAddress) {
+            setSelectedPoolAddress(poolAddress);
+            triggerAnalysis({ pair: signal.asset_pair, chainId, poolAddress }, false);
+            window.scrollTo({ top: 0, behavior: 'smooth' });
+        }
     };
 
     return (
@@ -246,16 +401,25 @@ export default function Dashboard() {
                     </div>
                     <div className="mt-2 text-3xl font-bold text-white">{positions.length}</div>
                 </div>
-                <div className="glass-card p-6 border-l-4 border-emerald-500">
+                <div className="glass-card p-6 border-l-4 border-emerald-500 relative overflow-hidden">
                     <div className="flex justify-between items-start">
                         <p className="text-slate-400 text-sm font-medium">Wallet Assets (All Chains)</p>
-                        <ArrowUpRight className="text-emerald-500 w-5 h-5" />
+                        <div className="flex items-center gap-2">
+                            {isWalletLoading && <RefreshCw className="w-4 h-4 text-emerald-500 animate-spin" />}
+                            <ArrowUpRight className="text-emerald-500 w-5 h-5" />
+                        </div>
                     </div>
                     <div className="mt-2 text-sm max-h-[100px] overflow-y-auto custom-scrollbar">
                         {balances.filter(b => parseFloat(b.balance) > 0).map((b, idx) => (
-                            <div key={`${b.symbol}-${idx}`} className="flex justify-between items-center text-sm">
-                                <span className="text-slate-400">{b.symbol}</span>
-                                <span className="font-bold text-white">{parseFloat(b.balance).toFixed(4)}</span>
+                            <div key={`${b.symbol}-${idx}`} className="flex justify-between items-center text-sm py-1 border-b border-slate-800/30 last:border-0 hover:bg-white/[0.02] transition-colors px-1">
+                                <div className="flex flex-col">
+                                    <span className="text-slate-400 font-medium">{b.symbol}</span>
+                                    <span className="text-[10px] text-slate-500">Chain: {b.chainId === 1 ? 'ETH' : b.chainId === 137 ? 'Polygon' : b.chainId === 10 ? 'OP' : b.chainId === 42161 ? 'Arb' : 'Base'}</span>
+                                </div>
+                                <div className="flex flex-col items-end">
+                                    <span className="font-bold text-white">{parseFloat(b.balance).toFixed(4)}</span>
+                                    <span className="text-[10px] text-emerald-500/80 font-black">${(b.balanceUSD || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+                                </div>
                             </div>
                         ))}
                         {balances.filter(b => parseFloat(b.balance) > 0).length === 0 && <span className="text-slate-500 italic text-xs">No assets found</span>}
@@ -266,151 +430,673 @@ export default function Dashboard() {
             {/* Main Content Grid */}
             <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
                 {/* Chart Section */}
-                <div className="lg:col-span-2 glass-card p-6 space-y-6">
-                    <div className="flex justify-between items-center">
+                <div className="lg:col-span-2 glass-card p-6 space-y-6 relative overflow-hidden">
+                    <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
                         <div className="flex items-center gap-4">
-                            <h2 className="text-xl font-semibold whitespace-nowrap">Market Analysis</h2>
-                            <select
-                                value={selectedPair}
-                                onChange={(e) => setSelectedPair(e.target.value)}
-                                className="bg-slate-900 border border-slate-800 rounded px-2 py-1 text-xs outline-none"
-                            >
-                                {settings.watched_pairs.map(p => <option key={p} value={p}>{p}</option>)}
-                            </select>
+                            <h2 className="text-xl font-bold tracking-tight text-white flex items-center gap-2">
+                                Market Analysis
+                                {isAnalyzing && <RefreshCw className="w-4 h-4 text-blue-500 animate-spin" />}
+                            </h2>
+                            <div className="flex gap-2">
+                                <select
+                                    value={selectedChainId}
+                                    onChange={(e) => setSelectedChainId(parseInt(e.target.value))}
+                                    className="bg-slate-900 border border-slate-800 rounded-lg px-3 py-1.5 text-xs text-slate-300 outline-none focus:ring-1 focus:ring-blue-500 transition-all"
+                                >
+                                    <option value={1}>Ethereum</option>
+                                    <option value={137}>Polygon</option>
+                                    <option value={10}>Optimism</option>
+                                    <option value={42161}>Arbitrum</option>
+                                    <option value={8453}>Base</option>
+                                </select>
+                                <select
+                                    value={selectedPoolAddress}
+                                    onChange={(e) => {
+                                        const pool = topPools.find(p => p.id === e.target.value);
+                                        if (pool) {
+                                            setSelectedPoolAddress(pool.id);
+                                            setSelectedPair(`${pool.token0.symbol}/${pool.token1.symbol}`);
+                                        }
+                                    }}
+                                    className="bg-slate-900 border border-slate-800 rounded-lg px-3 py-1.5 text-xs text-slate-300 outline-none focus:ring-1 focus:ring-blue-500 max-w-[150px] transition-all"
+                                >
+                                    {/* Group pools by pair symbol to show unique pairs */}
+                                    {Array.from(new Set(topPools.map(p => `${p.token0.symbol}/${p.token1.symbol}`))).map(pairSymbol => {
+                                        const firstPool = topPools.find(p => `${p.token0.symbol}/${p.token1.symbol}` === pairSymbol);
+                                        return (
+                                            <option key={firstPool.id} value={firstPool.id}>
+                                                {pairSymbol}
+                                            </option>
+                                        );
+                                    })}
+                                    {topPools.length === 0 && <option>Loading pools...</option>}
+                                </select>
+                            </div>
                         </div>
-                        <div className="flex gap-2">
-                            <span className="px-3 py-1 bg-blue-500/10 text-blue-400 rounded-full text-xs font-semibold">
-                                {lastAnalysis ? `$${lastAnalysis.currentPrice.toFixed(4)}` : 'Live Price'}
-                            </span>
-                        </div>
+
+                        <button
+                            onClick={() => triggerAnalysis(undefined, false)}
+                            disabled={isRefreshing || isAnalyzing || !selectedPoolAddress}
+                            className="px-6 py-2 bg-blue-600 hover:bg-blue-500 disabled:bg-slate-800 disabled:text-slate-500 text-white rounded-xl text-xs font-bold transition-all shadow-lg shadow-blue-600/20 flex items-center gap-2 active:scale-95"
+                        >
+                            {isAnalyzing ? <RefreshCw className="w-3 h-3 animate-spin" /> : <Activity className="w-3 h-3" />}
+                            {isAnalyzing ? 'Analyzing...' : 'Analyze Market Now'}
+                        </button>
                     </div>
-                    <div className="h-[300px] w-full">
-                        <ResponsiveContainer width="100%" height="100%">
-                            <AreaChart data={mockData}>
-                                <defs>
-                                    <linearGradient id="colorPrice" x1="0" y1="0" x2="0" y2="1">
-                                        <stop offset="5%" stopColor="#3b82f6" stopOpacity={0.3} />
-                                        <stop offset="95%" stopColor="#3b82f6" stopOpacity={0} />
-                                    </linearGradient>
-                                </defs>
-                                <CartesianGrid strokeDasharray="3 3" stroke="#26262a" vertical={false} />
-                                <XAxis dataKey="time" stroke="#64748b" fontSize={12} tickLine={false} axisLine={false} />
-                                <YAxis hide />
-                                <Tooltip
-                                    contentStyle={{ backgroundColor: '#161618', borderColor: '#26262a', color: '#fff' }}
-                                    itemStyle={{ color: '#3b82f6' }}
-                                />
-                                <Area type="monotone" dataKey="price" stroke="#3b82f6" strokeWidth={2} fillOpacity={1} fill="url(#colorPrice)" />
-                            </AreaChart>
-                        </ResponsiveContainer>
+                    <div className="flex gap-2">
+                        <span className="px-3 py-1 bg-blue-500/10 text-blue-400 rounded-full text-xs font-semibold">
+                            {lastAnalysis ? `$${formatPrice(lastAnalysis.currentPrice)}` : 'Live Price'}
+                        </span>
+                        {lastAnalysis && (
+                            <span className="px-3 py-1 bg-emerald-500/10 text-emerald-400 rounded-full text-[10px] font-semibold border border-emerald-500/20">
+                                Range: ${formatPrice(lastAnalysis.rangeMin)} - ${formatPrice(lastAnalysis.rangeMax)}
+                            </span>
+                        )}
+                    </div>
+
+                    <div className={`h-[300px] w-full mt-4 transition-opacity duration-300 ${isAnalyzing ? 'opacity-30' : 'opacity-100'}`}>
+                        {lastAnalysis ? (
+                            <ResponsiveContainer width="100%" height="100%">
+                                <ComposedChart data={lastAnalysis.chartData}>
+                                    <defs>
+                                        <linearGradient id="colorPrice" x1="0" y1="0" x2="0" y2="1">
+                                            <stop offset="5%" stopColor="#3b82f6" stopOpacity={0.3} />
+                                            <stop offset="95%" stopColor="#3b82f6" stopOpacity={0} />
+                                        </linearGradient>
+                                    </defs>
+                                    <CartesianGrid strokeDasharray="3 3" stroke="#26262a" vertical={false} />
+                                    <XAxis
+                                        dataKey="time"
+                                        stroke="#64748b"
+                                        fontSize={10}
+                                        tickLine={false}
+                                        axisLine={false}
+                                        minTickGap={30}
+                                    />
+                                    <YAxis
+                                        domain={['auto', 'auto']}
+                                        stroke="#64748b"
+                                        fontSize={10}
+                                        tickLine={false}
+                                        axisLine={false}
+                                        tickFormatter={(val) => `$${val.toFixed(2)}`}
+                                    />
+                                    <Tooltip
+                                        contentStyle={{ backgroundColor: '#161618', borderColor: '#26262a', color: '#fff', borderRadius: '8px', fontSize: '12px' }}
+                                        itemStyle={{ color: '#3b82f6' }}
+                                        formatter={(value: any) => [`$${formatPrice(parseFloat(value))}`, 'Price']}
+                                    />
+
+                                    <ReferenceArea
+                                        y1={lastAnalysis.rangeMin}
+                                        y2={lastAnalysis.rangeMax}
+                                        fill="#10b981"
+                                        fillOpacity={0.1}
+                                        stroke="#10b981"
+                                        strokeOpacity={0.3}
+                                        strokeDasharray="3 3"
+                                    />
+
+                                    <ReferenceLine
+                                        y={lastAnalysis.currentPrice}
+                                        stroke="#3b82f6"
+                                        strokeDasharray="3 3"
+                                        label={{ position: 'right', value: 'Live', fill: '#3b82f6', fontSize: 10 }}
+                                    />
+
+                                    <Area
+                                        type="monotone"
+                                        dataKey="price"
+                                        stroke="#3b82f6"
+                                        strokeWidth={2}
+                                        fillOpacity={1}
+                                        fill="url(#colorPrice)"
+                                        animationDuration={1000}
+                                    />
+                                </ComposedChart>
+                            </ResponsiveContainer>
+                        ) : (
+                            <div className="h-full w-full flex flex-col items-center justify-center bg-slate-900/20 rounded-3xl border border-slate-800/50 border-dashed">
+                                <Activity className="w-12 h-12 text-slate-800 mb-4" />
+                                <p className="text-slate-500 text-sm italic">Click "Analyze Market Now" to load the live chart and metrics.</p>
+                            </div>
+                        )}
                     </div>
                 </div>
 
-                {/* Signals Sidebar */}
+                {/* Analysis Details Panel */}
                 <div className="glass-card p-6 space-y-6">
-                    <h2 className="text-xl font-semibold flex items-center gap-2">
-                        <Bell className="w-5 h-5 text-amber-500" />
-                        Recent Signals
-                    </h2>
-                    <div className="space-y-4 max-h-[400px] overflow-y-auto pr-2 custom-scrollbar">
-                        {signals.length === 0 && (
-                            <p className="text-slate-500 text-sm text-center py-8">No signals yet. Click analyze to generate one.</p>
+                    <div className="flex items-center justify-between">
+                        <h2 className="text-xl font-bold text-white flex items-center gap-2">
+                            <Activity className="w-5 h-5 text-blue-500" />
+                            Detailed Metrics
+                        </h2>
+                        {lastAnalysis && lastAnalysis.recommendation && (
+                            <div className="flex flex-col items-end gap-1">
+                                <span className={`px-2 py-1 rounded-md text-[10px] font-bold uppercase ${lastAnalysis.recommendation.confidence > 70 ? 'bg-emerald-500/10 text-emerald-400' : 'bg-amber-500/10 text-amber-400'
+                                    }`}>
+                                    MM Conf: {lastAnalysis.recommendation.confidence.toFixed(0)}%
+                                </span>
+                                {lastAnalysis.recommendation.opportunityScore && (
+                                    <span className="text-[10px] font-bold text-blue-400 uppercase tracking-tighter">
+                                        Score: {lastAnalysis.recommendation.opportunityScore.toFixed(2)}
+                                    </span>
+                                )}
+                            </div>
                         )}
-                        {signals.map(signal => (
-                            <div key={signal.id} className="p-4 rounded-lg bg-slate-900/50 border border-slate-800 hover:border-slate-700 transition-all cursor-pointer">
-                                <div className="flex justify-between items-start mb-2">
-                                    <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${signal.type === 'entry' ? 'bg-emerald-500/10 text-emerald-400' : 'bg-rose-500/10 text-rose-400'
-                                        }`}>
-                                        {signal.type.toUpperCase()}
-                                    </span>
-                                    <span className="text-slate-500 text-[10px]">
-                                        {formatDistanceToNow(new Date(signal.created_at), { addSuffix: true })}
-                                    </span>
+                    </div>
+
+                    {!lastAnalysis && (
+                        <div className="py-20 text-center space-y-4">
+                            <div className="w-12 h-12 bg-slate-900/50 rounded-full flex items-center justify-center mx-auto border border-slate-800">
+                                <TrendingUp className="w-6 h-6 text-slate-700" />
+                            </div>
+                            <p className="text-slate-500 text-sm">Select a pair to see detailed indicators.</p>
+                        </div>
+                    )}
+
+                    {lastAnalysis && (
+                        <div className="space-y-6 animate-in fade-in slide-in-from-right-4 duration-500">
+                            {/* Price & Strategy */}
+                            <div className="grid grid-cols-2 gap-4">
+                                <div className="p-4 bg-slate-900/40 rounded-2xl border border-slate-800/50">
+                                    <p className="text-[10px] text-slate-500 uppercase font-bold tracking-wider mb-1">Live Price</p>
+                                    <p className="text-lg font-bold text-white">${formatPrice(lastAnalysis.currentPrice)}</p>
                                 </div>
-                                <h4 className="font-semibold text-sm text-white">{signal.asset_pair}</h4>
-                                <div className="text-xs text-slate-400 mt-1 whitespace-pre-line line-clamp-3">
-                                    {signal.message.replace(/\*/g, '').replace(/`/g, '').split('\n').filter(Boolean)[0]}...
+                                <div className="p-4 bg-slate-900/40 rounded-2xl border border-slate-800/50">
+                                    <p className="text-[10px] text-slate-500 uppercase font-bold tracking-wider mb-1">Recommended Fee</p>
+                                    <p className="text-lg font-bold text-blue-400">{(lastAnalysis.recommendation.feeTier / 10000).toFixed(2)}%</p>
                                 </div>
                             </div>
-                        ))}
-                    </div>
-                    <button
-                        onClick={() => triggerAnalysis()}
-                        disabled={isRefreshing}
-                        className="w-full py-3 premium-gradient rounded-xl font-bold text-sm shadow-lg hover:opacity-90 transition-opacity uppercase tracking-wider disabled:opacity-50"
-                    >
-                        {isRefreshing ? 'Thinking...' : 'Analyze Market Now'}
-                    </button>
+
+                            {/* Professional Multi-Ranges */}
+                            <div className="space-y-3">
+                                <p className="text-[10px] text-slate-500 uppercase font-bold tracking-wider mb-2">Professional LP Ranges</p>
+                                <div className="grid grid-cols-1 gap-3">
+                                    {/* Tight Range */}
+                                    <div className="p-3 bg-slate-900/40 rounded-xl border border-emerald-500/20 relative">
+                                        <div className="flex justify-between items-center mb-1">
+                                            <span className="text-[9px] font-bold text-emerald-400/80 uppercase">Tight (0.5x ATR)</span>
+                                            <span className="text-[9px] text-slate-500 font-medium">Fee: {((lastAnalysis.recommendation.feeTier || 3000) / 10000).toFixed(2)}%</span>
+                                        </div>
+                                        <div className="flex justify-between">
+                                            <div className="flex flex-col">
+                                                <span className="text-[8px] text-slate-500 uppercase">Min</span>
+                                                <span className="text-sm font-bold text-white">${formatPrice(lastAnalysis.recommendation.ranges?.tight?.min || 0)}</span>
+                                            </div>
+                                            <div className="flex flex-col items-end">
+                                                <span className="text-[8px] text-slate-500 uppercase">Max</span>
+                                                <span className="text-sm font-bold text-white">${formatPrice(lastAnalysis.recommendation.ranges?.tight?.max || 0)}</span>
+                                            </div>
+                                        </div>
+                                    </div>
+
+                                    {/* Medium Range */}
+                                    <div className="p-3 bg-slate-900/40 rounded-xl border border-blue-500/20 relative">
+                                        <div className="flex justify-between items-center mb-1">
+                                            <span className="text-[9px] font-bold text-blue-400/80 uppercase">Medium (1.0x ATR)</span>
+                                            <span className="text-[9px] text-slate-500 font-medium font-bold text-blue-400">APR: {lastAnalysis.realisticAPR?.toFixed(1)}%</span>
+                                        </div>
+                                        <div className="flex justify-between">
+                                            <div className="flex flex-col">
+                                                <span className="text-[8px] text-slate-500 uppercase">Min</span>
+                                                <span className="text-sm font-bold text-white">${formatPrice(lastAnalysis.recommendation.ranges?.medium?.min || lastAnalysis.rangeMin || 0)}</span>
+                                            </div>
+                                            <div className="flex flex-col items-end">
+                                                <span className="text-[8px] text-slate-500 uppercase">Max</span>
+                                                <span className="text-sm font-bold text-white">${formatPrice(lastAnalysis.recommendation.ranges?.medium?.max || lastAnalysis.rangeMax || 0)}</span>
+                                            </div>
+                                        </div>
+                                    </div>
+
+                                    {/* Wide Range */}
+                                    <div className="p-3 bg-slate-900/40 rounded-xl border border-purple-500/20 relative">
+                                        <div className="flex justify-between items-center mb-1">
+                                            <span className="text-[9px] font-bold text-purple-400/80 uppercase">Wide (1.5x ATR)</span>
+                                            <span className="text-[9px] text-slate-500 font-medium">Risk: Low</span>
+                                        </div>
+                                        <div className="flex justify-between">
+                                            <div className="flex flex-col">
+                                                <span className="text-[8px] text-slate-500 uppercase">Min</span>
+                                                <span className="text-sm font-bold text-white">${formatPrice(lastAnalysis.recommendation.ranges?.wide?.min || 0)}</span>
+                                            </div>
+                                            <div className="flex flex-col items-end">
+                                                <span className="text-[8px] text-slate-500 uppercase">Max</span>
+                                                <span className="text-sm font-bold text-white">${formatPrice(lastAnalysis.recommendation.ranges?.wide?.max || 0)}</span>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+
+                            {/* Technical Indicators */}
+                            <div className="space-y-3">
+                                <p className="text-[10px] text-slate-500 uppercase font-bold tracking-wider mb-2">Technical Indicators</p>
+                                <div className="grid grid-cols-2 gap-3">
+                                    <div className="flex justify-between items-center p-3 bg-slate-900/30 rounded-xl border border-slate-800/30">
+                                        <span className="text-xs text-slate-400">Regime</span>
+                                        <span className="text-xs font-bold text-white uppercase">{lastAnalysis.indicators?.regime || '---'}</span>
+                                    </div>
+                                    <div className="flex justify-between items-center p-3 bg-slate-900/30 rounded-xl border border-slate-800/30">
+                                        <span className="text-xs text-slate-400">ADX</span>
+                                        <span className="text-xs font-bold text-white">{lastAnalysis.indicators?.adx?.toFixed(2) || '---'}</span>
+                                    </div>
+                                    <div className="flex justify-between items-center p-3 bg-slate-900/30 rounded-xl border border-slate-800/30">
+                                        <span className="text-xs text-slate-400">ATR</span>
+                                        <span className="text-xs font-bold text-white">{lastAnalysis.indicators?.atr?.toFixed(4) || '---'}</span>
+                                    </div>
+                                    <div className="flex justify-between items-center p-3 bg-slate-900/30 rounded-xl border border-slate-800/30">
+                                        <span className="text-xs text-slate-400">RSI</span>
+                                        <span className="text-xs font-bold text-white">{lastAnalysis.indicators?.rsi?.toFixed(2) || '---'}</span>
+                                    </div>
+                                </div>
+                            </div>
+
+                            {/* Strategy Recommendation */}
+                            <div className="p-4 bg-gradient-to-br from-blue-600/10 to-purple-600/10 rounded-2xl border border-blue-500/20">
+                                <p className="text-[10px] text-blue-400 uppercase font-bold tracking-wider mb-2">Bot Strategy</p>
+                                <p className="text-sm font-medium text-white mb-1">{lastAnalysis.recommendation?.strategy || '---'}</p>
+                                <p className="text-[10px] text-slate-500 leading-relaxed italic">
+                                    Based on volatility and volume, this setup targets optimal fee capture while maintaining a safety margin.
+                                </p>
+                            </div>
+                        </div>
+                    )}
                 </div>
             </div>
 
-            {/* Positions Table */}
-            <div className="glass-card overflow-hidden">
-                <div className="p-6 border-b border-slate-800">
-                    <h2 className="text-xl font-semibold">Active LP Positions</h2>
+            {/* Market Scanner Section (Relocated & Improved) */}
+            <div className="glass-card p-8">
+                <div className="flex flex-col md:flex-row md:items-center justify-between gap-6 mb-8">
+                    <div>
+                        <h2 className="text-2xl font-bold text-white tracking-tight flex items-center gap-3">
+                            <Bell className="w-6 h-6 text-amber-500" />
+                            Market Scanner
+                        </h2>
+                        <p className="text-slate-400 text-sm mt-1">Cross-pair analysis to find top high-yield LP opportunities</p>
+                    </div>
+
+                    <div className="flex items-center gap-3 bg-slate-900/80 p-2 rounded-2xl border border-slate-800">
+                        <div className="flex items-center gap-2 px-3">
+                            <span className="text-xs text-slate-500 font-medium">Scan Limit</span>
+                            <select
+                                value={scanLimit}
+                                onChange={(e) => setScanLimit(parseInt(e.target.value))}
+                                className="bg-slate-800 border-none rounded-lg px-2 py-1 text-xs text-white outline-none cursor-pointer hover:bg-slate-700 transition-colors"
+                            >
+                                <option value={3}>TOP 3</option>
+                                <option value={4}>TOP 4</option>
+                                <option value={5}>TOP 5</option>
+                                <option value={10}>TOP 10</option>
+                            </select>
+                        </div>
+                        <div className="w-[1px] h-6 bg-slate-800"></div>
+                        <button
+                            onClick={runMarketScan}
+                            disabled={isScanning}
+                            className={`flex items-center gap-3 px-6 py-2 bg-blue-600 hover:bg-blue-500 disabled:bg-slate-800 disabled:text-slate-500 text-white rounded-xl text-xs font-bold transition-all shadow-lg shadow-blue-600/20 ${isScanning ? 'animate-pulse cursor-not-allowed' : 'active:scale-95'}`}
+                        >
+                            <RefreshCw className={`w-3 h-3 ${isScanning ? 'animate-spin' : ''}`} />
+                            {isScanning ? 'Scanning Network...' : 'Execute Market Scan'}
+                        </button>
+                    </div>
                 </div>
-                <div className="overflow-x-auto">
-                    <table className="w-full text-left">
-                        <thead className="bg-slate-900/50 text-slate-400 text-xs uppercase font-medium">
-                            <tr>
-                                <th className="px-6 py-4">Position Pair</th>
-                                <th className="px-6 py-4">Price Range</th>
-                                <th className="px-6 py-4">Estimated APR</th>
-                                <th className="px-6 py-4">Net Profit (IL + Fees)</th>
-                                <th className="px-6 py-4">Status</th>
-                                <th className="px-6 py-4">Action</th>
-                            </tr>
-                        </thead>
-                        <tbody className="divide-y divide-slate-800">
-                            {positions.length === 0 && (
-                                <tr>
-                                    <td colSpan={5} className="px-6 py-8 text-center text-slate-500 text-sm">
-                                        No active positions found for your wallets.
-                                    </td>
-                                </tr>
-                            )}
-                            {positions.map(pos => (
-                                <tr key={pos.id} className="hover:bg-slate-800/20 transition-colors">
-                                    <td className="px-6 py-4">
-                                        <div className="font-semibold text-white">{pos.pair}</div>
-                                        <div className="text-[10px] text-slate-500 uppercase tracking-tighter">{pos.chainName}</div>
-                                    </td>
-                                    <td className="px-6 py-4 text-slate-300 font-mono text-sm">{pos.range}</td>
-                                    <td className="px-6 py-4 text-emerald-400 font-bold">{pos.apr}</td>
-                                    <td className="px-6 py-4">
-                                        <div className={`font-bold ${pos.netProfitUSD >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
-                                            ${pos.netProfitUSD.toFixed(2)}
-                                        </div>
-                                        <div className="text-[10px] text-slate-500">
-                                            IL: ${pos.ilUSD.toFixed(2)} | Fees: ${pos.feesUSD.toFixed(2)}
-                                        </div>
-                                    </td>
-                                    <td className="px-6 py-4">
-                                        <span className={`inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-medium ${pos.status === 'In Range' ? 'bg-emerald-500/10 text-emerald-400' :
-                                            pos.status === 'Rebalance Soon' ? 'bg-amber-500/10 text-amber-400' :
-                                                'bg-rose-500/10 text-rose-400'
-                                            }`}>
-                                            <span className={`w-1.5 h-1.5 rounded-full ${pos.status === 'In Range' ? 'bg-emerald-500 animate-pulse' :
-                                                pos.status === 'Rebalance Soon' ? 'bg-amber-500' :
-                                                    'bg-rose-500'
-                                                }`}></span>
-                                            {pos.status}
+
+                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
+                    {isScanning && (
+                        <div className="col-span-full py-16 text-center space-y-4">
+                            <div className="relative inline-block">
+                                <div className="w-16 h-16 border-4 border-blue-500/20 border-t-blue-500 rounded-full animate-spin"></div>
+                                <div className="absolute inset-0 flex items-center justify-center">
+                                    <Activity className="w-6 h-6 text-blue-500 animate-pulse" />
+                                </div>
+                            </div>
+                            <div>
+                                <h3 className="text-white font-bold">Analyzing Liquidity Pools</h3>
+                                <p className="text-slate-500 text-sm max-w-xs mx-auto mt-1">Fetching volume and volatility data for top pairs across ALL supported networks...</p>
+                            </div>
+                        </div>
+                    )}
+
+                    {!isScanning && signals.length === 0 && (
+                        <div className="col-span-full py-16 text-center border-2 border-dashed border-slate-800/50 rounded-3xl">
+                            <Bell className="w-12 h-12 text-slate-800 mx-auto mb-4" />
+                            <p className="text-slate-500 text-sm">No recent scan results. Initiate a scan above.</p>
+                        </div>
+                    )}
+
+                    {!isScanning && signals.map(signal => {
+                        const signalChainId = signal.data?.chainId || signal.metadata?.chainId || 1;
+                        const networkName = signalChainId === 137 ? 'Polygon' : signalChainId === 1 ? 'Ethereum' : signalChainId === 10 ? 'Optimism' : signalChainId === 42161 ? 'Arbitrum' : signalChainId === 8453 ? 'Base' : `Chain ${signalChainId}`;
+
+                        return (
+                            <div key={signal.id} onClick={() => handleSignalClick(signal)} className="p-5 rounded-3xl bg-slate-900/30 border border-slate-800/50 hover:border-blue-500/30 transition-all cursor-pointer group hover:bg-slate-900/50">
+                                <div className="flex justify-between items-start mb-4">
+                                    <div className="flex flex-col">
+                                        <h4 className="font-bold text-white group-hover:text-blue-400 transition-colors">
+                                            {signal.asset_pair}
+                                            <span className="ml-2 text-[9px] text-slate-400 font-medium px-1.5 py-0.5 bg-slate-800 rounded">
+                                                {networkName}
+                                            </span>
+                                        </h4>
+                                        <span className="text-[10px] text-slate-500 uppercase tracking-widest mt-1">
+                                            {formatDistanceToNow(new Date(signal.created_at), { addSuffix: true })}
                                         </span>
-                                    </td>
-                                    <td className="px-6 py-4">
-                                        <button
-                                            onClick={() => triggerAnalysis(pos)}
-                                            className="text-blue-400 text-xs font-bold hover:underline py-1 px-2 border border-blue-400/20 rounded"
-                                        >
-                                            Optimize
-                                        </button>
-                                    </td>
+                                    </div>
+                                    <span className={`text-[9px] font-black px-2 py-1 rounded-lg uppercase tracking-wider ${signal.type === 'scan' ? 'bg-blue-500/10 text-blue-400' : 'bg-emerald-500/10 text-emerald-400'
+                                        }`}>
+                                        {signal.type}
+                                    </span>
+                                </div>
+
+                                <div className="space-y-3">
+                                    <div className="flex justify-between text-xs">
+                                        <span className="text-slate-500">Price</span>
+                                        <span className="text-white font-mono">${(signal.data?.currentPrice || signal.metadata?.price)?.toFixed(4) || '---'}</span>
+                                    </div>
+                                    <div className="flex justify-between text-xs">
+                                        <span className="text-slate-500">Confidence</span>
+                                        <span className={`font-bold ${((signal.data?.confidence || signal.metadata?.confidence) || 0) > 70 || ((signal.data?.confidence || signal.metadata?.confidence) || 0) > 0.7 ? 'text-emerald-400' : 'text-amber-400'
+                                            }`}>
+                                            {(() => {
+                                                const conf = signal.data?.confidence || signal.metadata?.confidence;
+                                                if (!conf) return '--';
+                                                return (conf <= 1 ? conf * 100 : conf).toFixed(0) + '%';
+                                            })()}
+                                        </span>
+                                    </div>
+                                    <div className="pt-3 border-t border-slate-800/50">
+                                        <p className="text-[10px] text-slate-400 leading-relaxed line-clamp-2 italic">
+                                            {signal.message.replace(/\*/g, '').replace(/`/g, '').split('\n').filter(Boolean).filter((l: string) => !l.includes(':')).join(' ')}
+                                        </p>
+                                    </div>
+                                </div>
+                            </div>
+                        );
+                    })}
+                </div>
+
+                {/* Alpha High Yield Detector Section */}
+                <div className="glass-card p-8 mt-8 border-t-2 border-amber-500/30">
+                    <div className="flex flex-col md:flex-row md:items-center justify-between gap-6 mb-8">
+                        <div>
+                            <h2 className="text-2xl font-bold text-white tracking-tight flex items-center gap-3">
+                                <Zap className="w-6 h-6 text-amber-500" />
+                                Alpha High Yield Detector
+                            </h2>
+                            <p className="text-slate-400 text-sm mt-1">Deep analysis for ultra high-yield (0.3% - 0.8% daily) elite pools</p>
+                        </div>
+
+                        <div className="flex gap-4">
+                            <button
+                                onClick={runHighYieldDetection}
+                                disabled={isDetectingHighYield}
+                                className={`flex items-center gap-3 px-8 py-3 bg-amber-600 hover:bg-amber-500 disabled:bg-slate-800 disabled:text-slate-500 text-white rounded-2xl text-sm font-black transition-all shadow-xl shadow-amber-600/20 ${isDetectingHighYield ? 'animate-pulse cursor-not-allowed' : 'active:scale-95'}`}
+                            >
+                                <Zap className={`w-4 h-4 ${isDetectingHighYield ? 'animate-spin' : ''}`} />
+                                {isDetectingHighYield ? 'Detecting Alpha...' : 'Scan for Alpha Opportunities'}
+                            </button>
+
+                            <button
+                                onClick={runAlphaSniperScan}
+                                disabled={isSniping}
+                                className={`flex items-center gap-3 px-8 py-3 bg-red-600 hover:bg-red-500 disabled:bg-slate-800 disabled:text-slate-500 text-white rounded-2xl text-sm font-black transition-all shadow-xl shadow-red-600/20 ${isSniping ? 'animate-bounce cursor-not-allowed' : 'active:scale-95'} border border-red-500/30`}
+                            >
+                                <Zap className={`w-4 h-4 ${isSniping ? 'animate-pulse' : ''}`} />
+                                {isSniping ? 'Sniping...' : 'Alpha Sniper'}
+                            </button>
+                        </div>
+                    </div>
+
+                    <div className="overflow-x-auto">
+                        <table className="w-full text-left">
+                            <thead className="bg-slate-900/50 text-slate-400 text-[10px] uppercase font-bold tracking-widest border-b border-slate-800">
+                                <tr>
+                                    <th className="px-6 py-4">Alpha Pool</th>
+                                    <th className="px-6 py-4">Yield Tier</th>
+                                    <th className="px-6 py-4">Chain</th>
+                                    <th className="px-6 py-4">TVL</th>
+                                    <th className="px-6 py-4 text-center">Vol/TVL</th>
+                                    <th className="px-6 py-4 text-right">Expected Yield</th>
+                                    <th className="px-6 py-4 text-right">Projected APR</th>
                                 </tr>
-                            ))}
-                        </tbody>
-                    </table>
+                            </thead>
+                            <tbody className="divide-y divide-slate-800/50">
+                                {highYieldPools.length === 0 && !isDetectingHighYield && (
+                                    <tr>
+                                        <td colSpan={7} className="px-6 py-12 text-center text-slate-500 text-sm italic">
+                                            No alpha opportunities detected yet. Start a deep scan to find 0.3%+ daily yield pools.
+                                        </td>
+                                    </tr>
+                                )}
+                                {isDetectingHighYield && (
+                                    <tr>
+                                        <td colSpan={7} className="px-6 py-12 text-center">
+                                            <div className="flex flex-col items-center gap-3">
+                                                <RefreshCw className="w-8 h-8 text-amber-500 animate-spin" />
+                                                <p className="text-amber-500 font-bold animate-pulse text-xs">Analyzing volatility and range efficiency across multiple chains...</p>
+                                            </div>
+                                        </td>
+                                    </tr>
+                                )}
+                                {highYieldPools.map((pool, idx) => (
+                                    <tr
+                                        key={`${pool.poolAddress}-${idx}`}
+                                        onClick={() => handleSignalClick({
+                                            asset_pair: pool.symbol,
+                                            data: { chainId: pool.chainId, poolAddress: pool.poolAddress }
+                                        })}
+                                        className="hover:bg-amber-500/5 transition-all cursor-pointer group border-l-2 border-transparent hover:border-amber-500"
+                                    >
+                                        <td className="px-6 py-4">
+                                            <div className="flex flex-col">
+                                                <span className="font-bold text-white group-hover:text-amber-400">{pool.symbol}</span>
+                                                <span className="text-[10px] text-slate-500 font-mono">{(pool.feeTier / 10000).toFixed(2)}% Tier</span>
+                                            </div>
+                                        </td>
+                                        <td className="px-6 py-4">
+                                            <span className={`px-2 py-1 rounded-md text-[9px] font-black uppercase tracking-tighter border ${pool.yieldTier?.includes('Extreme') ? 'bg-red-500/10 text-red-500 border-red-500/30' :
+                                                pool.yieldTier?.includes('Very High') ? 'bg-orange-500/10 text-orange-500 border-orange-500/30' :
+                                                    'bg-amber-500/10 text-amber-500 border-amber-500/30'
+                                                }`}>
+                                                {pool.yieldTier || 'N/A'}
+                                            </span>
+                                        </td>
+                                        <td className="px-6 py-4">
+                                            <span className="px-2 py-0.5 bg-slate-800 rounded text-[9px] font-bold text-slate-300 uppercase">
+                                                {pool.chainId === 1 ? 'Ethereum' : pool.chainId === 137 ? 'Polygon' : pool.chainId === 10 ? 'Optimism' : pool.chainId === 42161 ? 'Arbitrum' : pool.chainId === 8453 ? 'Base' : `Chain ${pool.chainId}`}
+                                            </span>
+                                        </td>
+                                        <td className="px-6 py-4">
+                                            <span className="text-xs font-medium text-slate-300">${(pool.tvl / 1000000).toFixed(1)}M</span>
+                                        </td>
+                                        <td className="px-6 py-4 text-center">
+                                            <span className="text-xs font-bold text-blue-400">{pool.volumeRatio.toFixed(2)}x</span>
+                                        </td>
+                                        <td className="px-6 py-4 text-right">
+                                            <div className="flex flex-col items-end">
+                                                <span className="text-sm font-black text-white">{(pool.expectedDailyYield * 100).toFixed(3)}%</span>
+                                                <span className="text-[9px] text-slate-500 uppercase">Daily</span>
+                                            </div>
+                                        </td>
+                                        <td className="px-6 py-4 text-right">
+                                            <div className="inline-flex flex-col items-end px-3 py-1 bg-amber-500/10 rounded-lg border border-amber-500/20">
+                                                <span className="text-sm font-black text-amber-500">{pool.expectedAPR.toFixed(1)}%</span>
+                                                <span className="text-[8px] font-bold text-amber-600/70 uppercase">Total APR</span>
+                                            </div>
+                                        </td>
+                                    </tr>
+                                ))}
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+
+                {/* Alpha Sniper Section */}
+                {alphaSniperResults.length > 0 && (
+                    <div className="mt-8 bg-slate-900/40 border border-red-500/20 rounded-[2.5rem] p-8 backdrop-blur-3xl shadow-2xl relative overflow-hidden">
+                        <div className="absolute top-0 right-0 w-64 h-64 bg-red-500/5 blur-[100px]" />
+                        <div className="flex items-center justify-between mb-8">
+                            <div className="flex items-center gap-4">
+                                <div className="p-4 bg-red-500/20 rounded-3xl border border-red-500/30">
+                                    <Zap className="w-6 h-6 text-red-500" />
+                                </div>
+                                <div>
+                                    <h2 className="text-2xl font-black text-white tracking-tight">Alpha Sniper Results</h2>
+                                    <p className="text-slate-400 text-sm">Ultra High Yield Signals (0.3% - 1.0% Daily)</p>
+                                </div>
+                            </div>
+                            <div className="px-5 py-2 bg-red-500/10 border border-red-500/30 rounded-2xl">
+                                <span className="text-red-500 font-black text-xs uppercase tracking-tighter">Live Alpha Detected</span>
+                            </div>
+                        </div>
+
+                        <div className="overflow-x-auto">
+                            <table className="w-full">
+                                <thead className="bg-red-950/20 text-red-400/70 text-[10px] uppercase font-black tracking-widest border-b border-red-900/30">
+                                    <tr>
+                                        <th className="px-6 py-5 text-left">Target Pool</th>
+                                        <th className="px-6 py-5 text-left">Chain</th>
+                                        <th className="px-6 py-5 text-center">Fee Tier</th>
+                                        <th className="px-6 py-5 text-right">Volume Efficiency</th>
+                                        <th className="px-6 py-5 text-right">Density (±0.5%)</th>
+                                        <th className="px-6 py-5 text-right">Expected Yield</th>
+                                        <th className="px-6 py-5 text-right">Alpha Score</th>
+                                        <th className="px-6 py-5 text-center">Strategy</th>
+                                    </tr>
+                                </thead>
+                                <tbody className="divide-y divide-red-900/10">
+                                    {alphaSniperResults.map((res, i) => (
+                                        <tr key={i} className="group hover:bg-red-500/[0.03] transition-colors cursor-pointer" onClick={() => {
+                                            setSelectedPoolAddress(res.poolAddress);
+                                            setSelectedChainId(res.chainId);
+                                            triggerAnalysis({ pair: res.pool, chainId: res.chainId, poolAddress: res.poolAddress }, false);
+                                            window.scrollTo({ top: 0, behavior: 'smooth' });
+                                        }}>
+                                            <td className="px-6 py-6">
+                                                <div className="flex flex-col">
+                                                    <span className="font-extrabold text-white group-hover:text-red-400 transition-colors uppercase">{res.pool}</span>
+                                                    <span className="text-[10px] text-slate-500 font-mono tracking-tighter">{(res.feeTier / 10000).toFixed(2)}% Fee Tier</span>
+                                                </div>
+                                            </td>
+                                            <td className="px-6 py-6">
+                                                <span className="px-3 py-1 bg-slate-800/80 rounded-xl text-[10px] font-black text-slate-300 uppercase letter-spacing-1">
+                                                    {res.chainId === 1 ? 'Ethereum' : res.chainId === 137 ? 'Polygon' : res.chainId === 10 ? 'Optimism' : res.chainId === 42161 ? 'Arbitrum' : res.chainId === 8453 ? 'Base' : `Chain ${res.chainId}`}
+                                                </span>
+                                            </td>
+                                            <td className="px-6 py-6 text-center">
+                                                <span className="px-2 py-1 bg-slate-800/50 border border-slate-700/50 rounded-lg text-[10px] font-mono font-bold text-slate-400">
+                                                    {(res.feeTier / 10000).toFixed(2)}%
+                                                </span>
+                                            </td>
+                                            <td className="px-6 py-6 text-right">
+                                                <div className="flex flex-col items-end">
+                                                    <span className="text-sm font-bold text-white">{res.volumeEfficiency.toFixed(2)}x</span>
+                                                    <span className="text-[9px] text-slate-500 uppercase">Vol/TVL</span>
+                                                </div>
+                                            </td>
+                                            <td className="px-6 py-6 text-right">
+                                                <span className="text-xs font-bold text-blue-400">{(res.liquidityDensity * 100).toFixed(1)}%</span>
+                                            </td>
+                                            <td className="px-6 py-6 text-right">
+                                                <div className="flex flex-col items-end">
+                                                    <span className="text-lg font-black text-red-400">{(res.expectedDailyYield * 100).toFixed(3)}%</span>
+                                                    <span className="text-[9px] text-red-600/50 font-black uppercase">Daily LP Yield</span>
+                                                </div>
+                                            </td>
+                                            <td className="px-6 py-6 text-right">
+                                                <div className="inline-flex px-3 py-1 bg-red-500/20 rounded-lg border border-red-500/40">
+                                                    <span className="text-sm font-black text-red-500">{res.alphaScore.toFixed(1)}</span>
+                                                </div>
+                                            </td>
+                                            <td className="px-6 py-6">
+                                                <div className="flex flex-wrap gap-1 justify-center">
+                                                    {res.strategyType.map((s: string, idx: number) => (
+                                                        <span key={idx} className={`px-2 py-0.5 rounded text-[8px] font-black uppercase tracking-tight ${s === 'Fee Spike' ? 'bg-purple-500/20 text-purple-400 border border-purple-500/30' :
+                                                            s === 'Liquidity Gap' ? 'bg-cyan-500/20 text-cyan-400 border border-cyan-500/30' :
+                                                                'bg-amber-500/20 text-amber-400 border border-amber-500/30'
+                                                            }`}>
+                                                            {s}
+                                                        </span>
+                                                    ))}
+                                                </div>
+                                            </td>
+                                        </tr>
+                                    ))}
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                )}
+
+                {/* Positions Table */}
+                <div className="glass-card overflow-hidden mt-8">
+                    <div className="p-6 border-b border-slate-800">
+                        <h2 className="text-xl font-semibold">Active LP Positions</h2>
+                    </div>
+                    <div className="overflow-x-auto">
+                        <table className="w-full text-left">
+                            <thead className="bg-slate-900/50 text-slate-400 text-xs uppercase font-medium">
+                                <tr>
+                                    <th className="px-6 py-4">Position Pair</th>
+                                    <th className="px-6 py-4">Price Range</th>
+                                    <th className="px-6 py-4">Estimated APR</th>
+                                    <th className="px-6 py-4">Net Profit (IL + Fees)</th>
+                                    <th className="px-6 py-4">Status</th>
+                                    <th className="px-6 py-4">Action</th>
+                                </tr>
+                            </thead>
+                            <tbody className="divide-y divide-slate-800">
+                                {positions.length === 0 && (
+                                    <tr>
+                                        <td colSpan={6} className="px-6 py-8 text-center text-slate-500 text-sm">
+                                            No active positions found for your wallets.
+                                        </td>
+                                    </tr>
+                                )}
+                                {positions.map(pos => (
+                                    <tr key={pos.id} className="hover:bg-slate-800/20 transition-colors">
+                                        <td className="px-6 py-4">
+                                            <div className="font-semibold text-white">{pos.pair}</div>
+                                            <div className="text-[10px] text-slate-500 uppercase tracking-tighter">{pos.chainName}</div>
+                                        </td>
+                                        <td className="px-6 py-4 text-slate-300 font-mono text-sm">{pos.range}</td>
+                                        <td className="px-6 py-4 text-emerald-400 font-bold">{pos.apr}</td>
+                                        <td className="px-6 py-4">
+                                            <div className={`font-bold ${pos.netProfitUSD >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                                                ${pos.netProfitUSD.toFixed(2)}
+                                            </div>
+                                            <div className="text-[10px] text-slate-500">
+                                                IL: ${pos.ilUSD.toFixed(2)} | Fees: ${pos.feesUSD.toFixed(2)}
+                                            </div>
+                                        </td>
+                                        <td className="px-6 py-4">
+                                            <span className={`inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-medium ${pos.status === 'In Range' ? 'bg-emerald-500/10 text-emerald-400' :
+                                                pos.status === 'Rebalance Soon' ? 'bg-amber-500/10 text-amber-400' :
+                                                    'bg-rose-500/10 text-rose-400'
+                                                }`}>
+                                                <span className={`w-1.5 h-1.5 rounded-full ${pos.status === 'In Range' ? 'bg-emerald-500 animate-pulse' :
+                                                    pos.status === 'Rebalance Soon' ? 'bg-amber-500' :
+                                                        'bg-rose-500'
+                                                    }`}></span>
+                                                {pos.status}
+                                            </span>
+                                        </td>
+                                        <td className="px-6 py-4">
+                                            <button
+                                                onClick={() => triggerAnalysis(pos)}
+                                                className="text-blue-400 text-xs font-bold hover:underline py-1 px-2 border border-blue-400/20 rounded"
+                                            >
+                                                Optimize
+                                            </button>
+                                        </td>
+                                    </tr>
+                                ))}
+                            </tbody>
+                        </table>
+                    </div>
                 </div>
             </div>
-        </div>
+        </div >
     );
 }
