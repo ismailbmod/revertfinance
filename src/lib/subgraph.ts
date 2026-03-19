@@ -233,7 +233,10 @@ export async function fetchPoolsByPair(token0Symbol: string, token1Symbol: strin
     }
 
     // Exact Match filtering with Alias support (treating WETH and ETH as equal)
-    const normalize = (s: string) => s.toUpperCase().replace(/^W(ETH|BTC|MATIC|BNB|SOL|AVAX)/, '$1');
+    const normalize = (s: string) => s.toUpperCase()
+      .replace(/^W(ETH|BTC|MATIC|BNB|SOL|AVAX)/, '$1')
+      .replace(/^CB(ETH|BTC)/, '$1')
+      .replace(/^AXLWBTC/, 'BTC');
     const target0 = normalize(token0Symbol);
     const target1 = normalize(token1Symbol);
 

@@ -247,8 +247,10 @@ export async function runAnalysis(pool: PoolConfig, riskProfile: 'risky' | 'medi
     });
 
     if (validPools.length === 0 && !specificPool) {
-        throw new Error(`No valid pools pass strict criteria for ${displaySymbol}`);
+        throw new Error(`No valid pools pass strict criteria for ${displaySymbol}. Try selecting a specific pool address to analyze.`);
     }
+
+    bestPool = specificPool || validPools[0];
 
     let maxScore = 0;
     const poolsToAnalyze = specificPool ? [specificPool] : validPools;
