@@ -200,8 +200,9 @@ export async function fetchPoolsByPair(token0Symbol: string, token1Symbol: strin
         token0 { symbol id }
         token1 { symbol id }
         createdAtTimestamp
-        poolDayData(first: 1, orderBy: date, orderDirection: desc) {
+        poolDayData(first: 7, orderBy: date, orderDirection: desc) {
           volumeUSD
+          date
         }
       }
     }
@@ -254,13 +255,13 @@ export async function fetchPoolsByPair(token0Symbol: string, token1Symbol: strin
   }
 }
 
-export async function fetchTopPools(chainId: number = 1, first: number = 50): Promise<SubgraphPool[]> {
-  const url = SUBGRAPH_URLS[chainId];
+export async function fetchTopPools(chainId: number = 1, first: number = 50, minTVL: number = 500000): Promise<SubgraphPool[]> {
+  const url = ANALYTICS_SUBGRAPH_URLS[chainId] || SUBGRAPH_URLS[chainId];
   if (!url) return [];
 
   const query = `
     {
-      pools(first: ${first}, orderBy: volumeUSD, orderDirection: desc, where: { totalValueLockedUSD_gt: "100000" }) {
+      pools(first: ${first}, orderBy: volumeUSD, orderDirection: desc, where: { totalValueLockedUSD_gt: "${minTVL}" }) {
         id
         feeTier
         totalValueLockedUSD

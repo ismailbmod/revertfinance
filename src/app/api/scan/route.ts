@@ -10,7 +10,7 @@ export async function POST(req: Request) {
         }
 
         // Scan all supported networks
-        const chainIdsToScan = [1, 137, 10, 42161, 8453];
+        const chainIdsToScan = [1, 137, 10, 42161, 8453, 56];
         const topopportunities = await scanMarket(chainIdsToScan, riskProfile, limit || 3);
 
         return NextResponse.json({ success: true, topopportunities });

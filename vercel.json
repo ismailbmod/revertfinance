@@ -1,1 +1,16 @@
-{}
+{
+  "crons": [
+    {
+      "path": "/api/cron/monitor",
+      "schedule": "*/15 * * * *"
+    },
+    {
+      "path": "/api/cron/alpha-sniper",
+      "schedule": "0 * * * *"
+    },
+    {
+      "path": "/api/cron/high-yield",
+      "schedule": "30 * * * *"
+    }
+  ]
+}

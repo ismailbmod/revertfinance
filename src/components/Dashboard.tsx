@@ -1,7 +1,7 @@
 "use client"
 
 import React, { useState, useEffect } from 'react';
-import { TrendingUp, Activity, Bell, Settings, ArrowUpRight, ArrowDownRight, RefreshCw, Zap } from 'lucide-react';
+import { TrendingUp, Activity, Bell, Settings, ArrowUpRight, ArrowDownRight, RefreshCw, Zap, Search } from 'lucide-react';
 import {
     AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
     BarChart, Bar, Cell, ComposedChart, ReferenceArea, ReferenceLine
@@ -31,6 +31,7 @@ interface Position {
     ilUSD: number;
     feesUSD: number;
     netProfitUSD: number;
+    marketAlert?: string;
 }
 
 export default function Dashboard() {
@@ -47,9 +48,12 @@ export default function Dashboard() {
     const [isAnalyzing, setIsAnalyzing] = useState(false);
     const [isScanning, setIsScanning] = useState(false);
     const [isDetectingHighYield, setIsDetectingHighYield] = useState(false);
+    const [isLoadingPools, setIsLoadingPools] = useState(false);
     const [highYieldPools, setHighYieldPools] = useState<any[]>([]);
     const [alphaSniperResults, setAlphaSniperResults] = useState<any[]>([]);
     const [isSniping, setIsSniping] = useState(false);
+    const [hasRunSniper, setHasRunSniper] = useState(false);
+    const [poolSearch, setPoolSearch] = useState('');
     const [settings, setSettings] = useState<{
         wallets: string[];
         risk_profile: string;
@@ -71,24 +75,31 @@ export default function Dashboard() {
     }, []);
 
     useEffect(() => {
+        setTopPools([]); // Clear pools on chain change
         fetchPools(selectedChainId);
     }, [selectedChainId]);
 
     const fetchPools = async (chainId: number) => {
+        setIsLoadingPools(true);
         try {
-            const res = await fetch(`/api/pools?chainId=${chainId}`);
+            const res = await fetch(`/api/pools?chainId=${chainId}&first=200&minTVL=10000`);
             const data = await res.json();
-            if (!data.error) {
+            if (!data.error && Array.isArray(data)) {
                 setTopPools(data);
                 // Set first pool as default if available
-                if (data.length > 0 && !selectedPoolAddress) {
+                if (data.length > 0) {
                     const first = data[0];
                     setSelectedPair(`${first.token0.symbol}/${first.token1.symbol}`);
                     setSelectedPoolAddress(first.id);
                 }
+            } else {
+                setTopPools([]);
             }
         } catch (e) {
             console.error(e);
+            setTopPools([]);
+        } finally {
+            setIsLoadingPools(false);
         }
     };
 
@@ -174,7 +185,7 @@ export default function Dashboard() {
                 })
             });
             const data = await res.json();
-            if (data.result) {
+            if (res.ok && data.result) {
                 setLastAnalysis(data.result);
                 if (!silent) {
                     fetchSignals();
@@ -183,7 +194,8 @@ export default function Dashboard() {
                 }
             } else if (!silent) {
                 setLastAnalysis(null);
-                alert(`Analysis unavailable: Price oracle not found on Binance for this pair.`);
+                const errorMsg = data.error || (data.result === null ? "Price oracle not found on Binance for this pair." : "Analysis unavailable.");
+                alert(`Analysis Error: ${errorMsg}`);
             }
         } catch (e) {
             console.error(e);
@@ -222,6 +234,7 @@ export default function Dashboard() {
                 }));
                 setSignals(formattedSignals);
             } else if (data.success) {
+                setSignals([]); // Clear old results to reflect current state
                 alert("Scan complete! No high-yield opportunities met the current validation criteria on the scanned networks.");
             } else {
                 alert(`Scan failed: ${data.error || 'Unknown error'}`);
@@ -261,7 +274,8 @@ export default function Dashboard() {
             const res = await fetch('/api/alpha-sniper', { method: 'POST' });
             const data = await res.json();
             if (data.success) {
-                setAlphaSniperResults(data.opportunities);
+                setAlphaSniperResults(data.opportunities || []);
+                setHasRunSniper(true);
             } else {
                 alert(data.error || 'Alpha Sniper scan failed');
             }
@@ -448,7 +462,20 @@ export default function Dashboard() {
                                     <option value={10}>Optimism</option>
                                     <option value={42161}>Arbitrum</option>
                                     <option value={8453}>Base</option>
+                                    <option value={56}>BNB Chain</option>
                                 </select>
+                                <div className="relative group">
+                                    <div className="absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none">
+                                        <Search className="w-3 h-3 text-slate-500" />
+                                    </div>
+                                    <input 
+                                        type="text"
+                                        placeholder="Search pair (e.g. SN3)"
+                                        value={poolSearch}
+                                        onChange={(e) => setPoolSearch(e.target.value)}
+                                        className="bg-slate-900 border border-slate-800 rounded-lg pl-8 pr-3 py-1.5 text-xs text-slate-300 outline-none focus:ring-1 focus:ring-blue-500 w-[180px] transition-all"
+                                    />
+                                </div>
                                 <select
                                     value={selectedPoolAddress}
                                     onChange={(e) => {
@@ -460,16 +487,27 @@ export default function Dashboard() {
                                     }}
                                     className="bg-slate-900 border border-slate-800 rounded-lg px-3 py-1.5 text-xs text-slate-300 outline-none focus:ring-1 focus:ring-blue-500 max-w-[150px] transition-all"
                                 >
-                                    {/* Group pools by pair symbol to show unique pairs */}
-                                    {Array.from(new Set(topPools.map(p => `${p.token0.symbol}/${p.token1.symbol}`))).map(pairSymbol => {
-                                        const firstPool = topPools.find(p => `${p.token0.symbol}/${p.token1.symbol}` === pairSymbol);
-                                        return (
-                                            <option key={firstPool.id} value={firstPool.id}>
-                                                {pairSymbol}
-                                            </option>
-                                        );
-                                    })}
-                                    {topPools.length === 0 && <option>Loading pools...</option>}
+                                    {isLoadingPools ? (
+                                        <option value="">Loading pools...</option>
+                                    ) : topPools.length > 0 ? (
+                                        (() => {
+                                            const filtered = Array.from(new Set(topPools.map(p => `${p.token0.symbol}/${p.token1.symbol}`)))
+                                                .filter(pair => pair.toLowerCase().includes(poolSearch.toLowerCase()));
+                                            
+                                            if (filtered.length === 0) return <option value="">No matching pairs</option>;
+                                            
+                                            return filtered.map(pairSymbol => {
+                                                const firstPool = topPools.find(p => `${p.token0.symbol}/${p.token1.symbol}` === pairSymbol);
+                                                return (
+                                                    <option key={firstPool.id} value={firstPool.id}>
+                                                        {pairSymbol}
+                                                    </option>
+                                                );
+                                            });
+                                        })()
+                                    ) : (
+                                        <option value="">No pools found</option>
+                                    )}
                                 </select>
                             </div>
                         </div>
@@ -488,9 +526,22 @@ export default function Dashboard() {
                             {lastAnalysis ? `$${formatPrice(lastAnalysis.currentPrice)}` : 'Live Price'}
                         </span>
                         {lastAnalysis && (
-                            <span className="px-3 py-1 bg-emerald-500/10 text-emerald-400 rounded-full text-[10px] font-semibold border border-emerald-500/20">
-                                Range: ${formatPrice(lastAnalysis.rangeMin)} - ${formatPrice(lastAnalysis.rangeMax)}
-                            </span>
+                            <div className="flex gap-2">
+                                <span className={`px-3 py-1 rounded-full text-[10px] font-bold border ${['STRONG TREND', 'VOLATILE TREND'].includes(lastAnalysis.marketRegime) ? 'bg-rose-500/10 text-rose-400 border-rose-500/20' :
+                                    ['TREND', 'MIXED'].includes(lastAnalysis.marketRegime) ? 'bg-amber-500/10 text-amber-400 border-amber-500/20' :
+                                        'bg-emerald-500/10 text-emerald-400 border-emerald-500/20'
+                                    }`}>
+                                    Regime: {lastAnalysis.marketRegime}
+                                </span>
+                                <span className="px-3 py-1 bg-emerald-500/10 text-emerald-400 rounded-full text-[10px] font-semibold border border-emerald-500/20">
+                                    Range: ${formatPrice(lastAnalysis.rangeMin)} - ${formatPrice(lastAnalysis.rangeMax)}
+                                </span>
+                                {lastAnalysis.stopLoss && (
+                                    <span className="px-3 py-1 bg-rose-500/10 text-rose-400 rounded-full text-[10px] font-semibold border border-rose-500/20">
+                                        Stop Loss: ${formatPrice(lastAnalysis.stopLoss)}
+                                    </span>
+                                )}
+                            </div>
                         )}
                     </div>
 
@@ -544,6 +595,15 @@ export default function Dashboard() {
                                         label={{ position: 'right', value: 'Live', fill: '#3b82f6', fontSize: 10 }}
                                     />
 
+                                    {lastAnalysis.stopLoss && (
+                                        <ReferenceLine
+                                            y={lastAnalysis.stopLoss}
+                                            stroke="#f43f5e"
+                                            strokeDasharray="5 5"
+                                            label={{ position: 'left', value: 'Stop Loss', fill: '#f43f5e', fontSize: 10 }}
+                                        />
+                                    )}
+
                                     <Area
                                         type="monotone"
                                         dataKey="price"
@@ -573,13 +633,19 @@ export default function Dashboard() {
                         </h2>
                         {lastAnalysis && lastAnalysis.recommendation && (
                             <div className="flex flex-col items-end gap-1">
-                                <span className={`px-2 py-1 rounded-md text-[10px] font-bold uppercase ${lastAnalysis.recommendation.confidence > 70 ? 'bg-emerald-500/10 text-emerald-400' : 'bg-amber-500/10 text-amber-400'
+                                <span className={`px-2 py-1 rounded-md text-[10px] font-bold uppercase ${lastAnalysis.safetyScore >= 80 ? 'bg-emerald-500/10 text-emerald-400' :
+                                    lastAnalysis.safetyScore >= 60 ? 'bg-blue-500/10 text-blue-400' :
+                                        lastAnalysis.safetyScore >= 40 ? 'bg-amber-500/10 text-amber-400' :
+                                            'bg-rose-500/10 text-rose-400'
                                     }`}>
-                                    MM Conf: {lastAnalysis.recommendation.confidence.toFixed(0)}%
+                                    Safety: {lastAnalysis.safetyScore}/100
                                 </span>
-                                {lastAnalysis.recommendation.opportunityScore && (
-                                    <span className="text-[10px] font-bold text-blue-400 uppercase tracking-tighter">
-                                        Score: {lastAnalysis.recommendation.opportunityScore.toFixed(2)}
+                                {lastAnalysis.marketRegime && (
+                                    <span className={`text-[10px] font-bold uppercase tracking-tighter ${['STABLE RANGE', 'RANGING'].includes(lastAnalysis.marketRegime) ? 'text-emerald-400' :
+                                        ['MIXED', 'TREND'].includes(lastAnalysis.marketRegime) ? 'text-amber-400' :
+                                            'text-rose-400'
+                                        }`}>
+                                        Regime: {lastAnalysis.marketRegime}
                                     </span>
                                 )}
                             </div>
@@ -609,63 +675,48 @@ export default function Dashboard() {
                                 </div>
                             </div>
 
-                            {/* Professional Multi-Ranges */}
+                             {/* Optimal Range & Exit */}
                             <div className="space-y-3">
-                                <p className="text-[10px] text-slate-500 uppercase font-bold tracking-wider mb-2">Professional LP Ranges</p>
+                                <p className="text-[10px] text-slate-500 uppercase font-bold tracking-wider mb-2">Strategy Parameters</p>
                                 <div className="grid grid-cols-1 gap-3">
-                                    {/* Tight Range */}
+                                    {/* Optimal Range */}
                                     <div className="p-3 bg-slate-900/40 rounded-xl border border-emerald-500/20 relative">
                                         <div className="flex justify-between items-center mb-1">
-                                            <span className="text-[9px] font-bold text-emerald-400/80 uppercase">Tight (0.5x ATR)</span>
-                                            <span className="text-[9px] text-slate-500 font-medium">Fee: {((lastAnalysis.recommendation.feeTier || 3000) / 10000).toFixed(2)}%</span>
+                                            <span className="text-[9px] font-bold text-emerald-400/80 uppercase">Optimal Range</span>
+                                            <span className="text-[9px] text-emerald-400 font-bold">Stable APR: {lastAnalysis.realisticAPR?.toFixed(1)}%</span>
                                         </div>
-                                        <div className="flex justify-between">
+                                        <div className="flex justify-between mb-2">
                                             <div className="flex flex-col">
                                                 <span className="text-[8px] text-slate-500 uppercase">Min</span>
-                                                <span className="text-sm font-bold text-white">${formatPrice(lastAnalysis.recommendation.ranges?.tight?.min || 0)}</span>
+                                                <span className="text-sm font-bold text-white">${formatPrice(lastAnalysis.rangeMin)}</span>
                                             </div>
                                             <div className="flex flex-col items-end">
                                                 <span className="text-[8px] text-slate-500 uppercase">Max</span>
-                                                <span className="text-sm font-bold text-white">${formatPrice(lastAnalysis.recommendation.ranges?.tight?.max || 0)}</span>
+                                                <span className="text-sm font-bold text-white">${formatPrice(lastAnalysis.rangeMax)}</span>
                                             </div>
+                                        </div>
+                                        <div className="flex justify-between items-center border-t border-slate-800/80 pt-2 mt-2">
+                                            <span className="text-[9px] font-medium text-slate-400 text-center flex-1">Width: {lastAnalysis.rangeWidthPct?.toFixed(2)}%</span>
+                                            <span className="text-[9px] font-medium text-emerald-500/80 text-center flex-1 border-l border-slate-800">~{lastAnalysis.estimatedTimeHours || 0}h Est. Lifetime</span>
                                         </div>
                                     </div>
 
-                                    {/* Medium Range */}
-                                    <div className="p-3 bg-slate-900/40 rounded-xl border border-blue-500/20 relative">
-                                        <div className="flex justify-between items-center mb-1">
-                                            <span className="text-[9px] font-bold text-blue-400/80 uppercase">Medium (1.0x ATR)</span>
-                                            <span className="text-[9px] text-slate-500 font-medium font-bold text-blue-400">APR: {lastAnalysis.realisticAPR?.toFixed(1)}%</span>
-                                        </div>
-                                        <div className="flex justify-between">
-                                            <div className="flex flex-col">
-                                                <span className="text-[8px] text-slate-500 uppercase">Min</span>
-                                                <span className="text-sm font-bold text-white">${formatPrice(lastAnalysis.recommendation.ranges?.medium?.min || lastAnalysis.rangeMin || 0)}</span>
+                                    {/* Stop Loss */}
+                                    {lastAnalysis.stopLoss && (
+                                        <div className="p-3 bg-slate-900/40 rounded-xl border border-rose-500/20 relative">
+                                            <div className="flex justify-between items-center mb-1">
+                                                <span className="text-[9px] font-bold text-rose-400/80 uppercase">Lower Exit (Stop Loss)</span>
+                                                <span className="text-[9px] text-slate-500 font-medium">Auto-Swap</span>
                                             </div>
-                                            <div className="flex flex-col items-end">
-                                                <span className="text-[8px] text-slate-500 uppercase">Max</span>
-                                                <span className="text-sm font-bold text-white">${formatPrice(lastAnalysis.recommendation.ranges?.medium?.max || lastAnalysis.rangeMax || 0)}</span>
+                                            <div className="flex justify-center mb-2">
+                                                <span className="text-sm font-bold text-white">${formatPrice(lastAnalysis.stopLoss)}</span>
                                             </div>
-                                        </div>
-                                    </div>
-
-                                    {/* Wide Range */}
-                                    <div className="p-3 bg-slate-900/40 rounded-xl border border-purple-500/20 relative">
-                                        <div className="flex justify-between items-center mb-1">
-                                            <span className="text-[9px] font-bold text-purple-400/80 uppercase">Wide (1.5x ATR)</span>
-                                            <span className="text-[9px] text-slate-500 font-medium">Risk: Low</span>
-                                        </div>
-                                        <div className="flex justify-between">
-                                            <div className="flex flex-col">
-                                                <span className="text-[8px] text-slate-500 uppercase">Min</span>
-                                                <span className="text-sm font-bold text-white">${formatPrice(lastAnalysis.recommendation.ranges?.wide?.min || 0)}</span>
-                                            </div>
-                                            <div className="flex flex-col items-end">
-                                                <span className="text-[8px] text-slate-500 uppercase">Max</span>
-                                                <span className="text-sm font-bold text-white">${formatPrice(lastAnalysis.recommendation.ranges?.wide?.max || 0)}</span>
+                                            <div className="flex justify-between items-center border-t border-slate-800/80 pt-2 mt-2">
+                                                <span className="text-[9px] font-medium text-slate-400 text-center flex-1">Est. Loss: -{lastAnalysis.estimatedLossPct?.toFixed(2)}%</span>
+                                                <span className="text-[9px] font-medium text-rose-400/80 text-center flex-1 border-l border-slate-800">R/R Ratio: {lastAnalysis.riskRewardRatio?.toFixed(2)}</span>
                                             </div>
                                         </div>
-                                    </div>
+                                    )}
                                 </div>
                             </div>
 
@@ -678,8 +729,10 @@ export default function Dashboard() {
                                         <span className="text-xs font-bold text-white uppercase">{lastAnalysis.indicators?.regime || '---'}</span>
                                     </div>
                                     <div className="flex justify-between items-center p-3 bg-slate-900/30 rounded-xl border border-slate-800/30">
-                                        <span className="text-xs text-slate-400">ADX</span>
-                                        <span className="text-xs font-bold text-white">{lastAnalysis.indicators?.adx?.toFixed(2) || '---'}</span>
+                                        <span className="text-xs text-slate-400">Volume Spike</span>
+                                        <span className={`text-xs font-bold ${lastAnalysis.indicators?.volumeSpike > 2 ? 'text-rose-400' : 'text-white'}`}>
+                                            {lastAnalysis.indicators?.volumeSpike?.toFixed(1) || '---'}x
+                                        </span>
                                     </div>
                                     <div className="flex justify-between items-center p-3 bg-slate-900/30 rounded-xl border border-slate-800/30">
                                         <span className="text-xs text-slate-400">ATR</span>
@@ -694,7 +747,10 @@ export default function Dashboard() {
 
                             {/* Strategy Recommendation */}
                             <div className="p-4 bg-gradient-to-br from-blue-600/10 to-purple-600/10 rounded-2xl border border-blue-500/20">
-                                <p className="text-[10px] text-blue-400 uppercase font-bold tracking-wider mb-2">Bot Strategy</p>
+                                <div className="flex justify-between items-center mb-2">
+                                    <p className="text-[10px] text-blue-400 uppercase font-bold tracking-wider">Bot Strategy</p>
+                                    <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${lastAnalysis.tradeRecommendation === 'STRONG BUY' ? 'bg-emerald-500/20 text-emerald-400' : lastAnalysis.tradeRecommendation === 'MODERATE' ? 'bg-amber-500/20 text-amber-400' : 'bg-rose-500/20 text-rose-400'}`}>{lastAnalysis.tradeRecommendation}</span>
+                                </div>
                                 <p className="text-sm font-medium text-white mb-1">{lastAnalysis.recommendation?.strategy || '---'}</p>
                                 <p className="text-[10px] text-slate-500 leading-relaxed italic">
                                     Based on volatility and volume, this setup targets optimal fee capture while maintaining a safety margin.
@@ -767,7 +823,7 @@ export default function Dashboard() {
 
                     {!isScanning && signals.map(signal => {
                         const signalChainId = signal.data?.chainId || signal.metadata?.chainId || 1;
-                        const networkName = signalChainId === 137 ? 'Polygon' : signalChainId === 1 ? 'Ethereum' : signalChainId === 10 ? 'Optimism' : signalChainId === 42161 ? 'Arbitrum' : signalChainId === 8453 ? 'Base' : `Chain ${signalChainId}`;
+                        const networkName = signalChainId === 137 ? 'Polygon' : signalChainId === 1 ? 'Ethereum' : signalChainId === 10 ? 'Optimism' : signalChainId === 42161 ? 'Arbitrum' : signalChainId === 8453 ? 'Base' : signalChainId === 56 ? 'BNB' : `Chain ${signalChainId}`;
 
                         return (
                             <div key={signal.id} onClick={() => handleSignalClick(signal)} className="p-5 rounded-3xl bg-slate-900/30 border border-slate-800/50 hover:border-blue-500/30 transition-all cursor-pointer group hover:bg-slate-900/50">
@@ -795,14 +851,22 @@ export default function Dashboard() {
                                         <span className="text-white font-mono">${(signal.data?.currentPrice || signal.metadata?.price)?.toFixed(4) || '---'}</span>
                                     </div>
                                     <div className="flex justify-between text-xs">
-                                        <span className="text-slate-500">Confidence</span>
-                                        <span className={`font-bold ${((signal.data?.confidence || signal.metadata?.confidence) || 0) > 70 || ((signal.data?.confidence || signal.metadata?.confidence) || 0) > 0.7 ? 'text-emerald-400' : 'text-amber-400'
+                                        <span className="text-slate-500">Safety Score</span>
+                                        <span className={`font-bold ${signal.data?.safetyScore >= 80 ? 'text-emerald-400' :
+                                            signal.data?.safetyScore >= 60 ? 'text-blue-400' :
+                                                signal.data?.safetyScore >= 40 ? 'text-amber-400' :
+                                                    'text-rose-400'
                                             }`}>
-                                            {(() => {
-                                                const conf = signal.data?.confidence || signal.metadata?.confidence;
-                                                if (!conf) return '--';
-                                                return (conf <= 1 ? conf * 100 : conf).toFixed(0) + '%';
-                                            })()}
+                                            {signal.data?.safetyScore || '--'}/100
+                                        </span>
+                                    </div>
+                                    <div className="flex justify-between text-xs">
+                                        <span className="text-slate-500">Regime</span>
+                                        <span className={`font-bold uppercase ${signal.data?.marketRegime === 'Good' ? 'text-emerald-400' :
+                                            signal.data?.marketRegime === 'Risky' ? 'text-amber-400' :
+                                                'text-rose-400'
+                                            }`}>
+                                            {signal.data?.marketRegime || '--'}
                                         </span>
                                     </div>
                                     <div className="pt-3 border-t border-slate-800/50">
@@ -933,7 +997,7 @@ export default function Dashboard() {
                 </div>
 
                 {/* Alpha Sniper Section */}
-                {alphaSniperResults.length > 0 && (
+                {(alphaSniperResults.length > 0 || hasRunSniper || isSniping) && (
                     <div className="mt-8 bg-slate-900/40 border border-red-500/20 rounded-[2.5rem] p-8 backdrop-blur-3xl shadow-2xl relative overflow-hidden">
                         <div className="absolute top-0 right-0 w-64 h-64 bg-red-500/5 blur-[100px]" />
                         <div className="flex items-center justify-between mb-8">
@@ -961,11 +1025,34 @@ export default function Dashboard() {
                                         <th className="px-6 py-5 text-right">Volume Efficiency</th>
                                         <th className="px-6 py-5 text-right">Density (±0.5%)</th>
                                         <th className="px-6 py-5 text-right">Expected Yield</th>
+                                        <th className="px-6 py-5 text-right">Diagnostics</th>
                                         <th className="px-6 py-5 text-right">Alpha Score</th>
                                         <th className="px-6 py-5 text-center">Strategy</th>
                                     </tr>
                                 </thead>
                                 <tbody className="divide-y divide-red-900/10">
+                                    {isSniping && alphaSniperResults.length === 0 && (
+                                        <tr>
+                                            <td colSpan={9} className="px-6 py-20 text-center">
+                                                <div className="flex flex-col items-center">
+                                                    <RefreshCw className="w-12 h-12 text-red-500 mb-4 animate-spin opacity-50" />
+                                                    <p className="text-red-400 font-bold animate-pulse">Scanning Ethereum, Base, Arbitrum, Optimism & Polygon...</p>
+                                                    <p className="text-slate-500 text-[10px] mt-2 italic">Filtering for TVL &gt; 5M, Vol &gt; 1M, VolEfficiency &gt; 0.1</p>
+                                                </div>
+                                            </td>
+                                        </tr>
+                                    )}
+                                    {alphaSniperResults.length === 0 && !isSniping && hasRunSniper && (
+                                        <tr>
+                                            <td colSpan={9} className="px-6 py-20 text-center">
+                                                <div className="flex flex-col items-center">
+                                                    <Zap className="w-12 h-12 text-slate-800 mb-4 opacity-20" />
+                                                    <p className="text-slate-500 font-medium">No high-quality Alpha Sniper opportunities found matching your filters.</p>
+                                                    <p className="text-slate-600 text-xs mt-2 italic">Scanning Polygon, Arbitrum, Base, Optimism, and Ethereum...</p>
+                                                </div>
+                                            </td>
+                                        </tr>
+                                    )}
                                     {alphaSniperResults.map((res, i) => (
                                         <tr key={i} className="group hover:bg-red-500/[0.03] transition-colors cursor-pointer" onClick={() => {
                                             setSelectedPoolAddress(res.poolAddress);
@@ -981,7 +1068,7 @@ export default function Dashboard() {
                                             </td>
                                             <td className="px-6 py-6">
                                                 <span className="px-3 py-1 bg-slate-800/80 rounded-xl text-[10px] font-black text-slate-300 uppercase letter-spacing-1">
-                                                    {res.chainId === 1 ? 'Ethereum' : res.chainId === 137 ? 'Polygon' : res.chainId === 10 ? 'Optimism' : res.chainId === 42161 ? 'Arbitrum' : res.chainId === 8453 ? 'Base' : `Chain ${res.chainId}`}
+                                                    {res.chainId === 1 ? 'Ethereum' : res.chainId === 137 ? 'Polygon' : res.chainId === 10 ? 'Optimism' : res.chainId === 42161 ? 'Arbitrum' : res.chainId === 8453 ? 'Base' : res.chainId === 56 ? 'BNB' : `Chain ${res.chainId}`}
                                                 </span>
                                             </td>
                                             <td className="px-6 py-6 text-center">
@@ -1005,15 +1092,26 @@ export default function Dashboard() {
                                                 </div>
                                             </td>
                                             <td className="px-6 py-6 text-right">
-                                                <div className="inline-flex px-3 py-1 bg-red-500/20 rounded-lg border border-red-500/40">
-                                                    <span className="text-sm font-black text-red-500">{res.alphaScore.toFixed(1)}</span>
+                                                <div className="flex flex-col items-end gap-0.5">
+                                                    <span className="text-[10px] text-slate-300 font-mono">ATR: {res.diagnostics?.atrPct?.toFixed(2) || '-'}%</span>
+                                                    <span className="text-[10px] text-slate-300 font-mono">ADX: {res.diagnostics?.lastADX?.toFixed(1) || '-'}</span>
+                                                    <span className="text-[10px] text-slate-300 font-mono">VolSpike: {res.diagnostics?.volumeSpike?.toFixed(1) || '-'}x</span>
+                                                </div>
+                                            </td>
+                                            <td className="px-6 py-6 text-right">
+                                                <div className="flex flex-col items-end">
+                                                    <div className="inline-flex px-3 py-1 bg-red-500/20 rounded-lg border border-red-500/40 mb-1">
+                                                        <span className="text-sm font-black text-red-500">{res.alphaScore?.toFixed(1) || '0.0'}</span>
+                                                    </div>
+                                                    <span className={`text-[9px] font-black uppercase ${res.recommendation === 'STRONG OPPORTUNITY' ? 'text-emerald-400' : 'text-amber-400'}`}>{res.recommendation || '---'}</span>
                                                 </div>
                                             </td>
                                             <td className="px-6 py-6">
                                                 <div className="flex flex-wrap gap-1 justify-center">
                                                     {res.strategyType.map((s: string, idx: number) => (
-                                                        <span key={idx} className={`px-2 py-0.5 rounded text-[8px] font-black uppercase tracking-tight ${s === 'Fee Spike' ? 'bg-purple-500/20 text-purple-400 border border-purple-500/30' :
+                                                        <span key={idx} className={`px-2 py-0.5 rounded text-[8px] font-black uppercase tracking-tight text-center ${s === 'Fee Spike' ? 'bg-purple-500/20 text-purple-400 border border-purple-500/30' :
                                                             s === 'Liquidity Gap' ? 'bg-cyan-500/20 text-cyan-400 border border-cyan-500/30' :
+                                                            s.includes('EXTREME') || s.includes('HIGH RISK') ? 'bg-red-500/80 text-white font-black animate-pulse' :
                                                                 'bg-amber-500/20 text-amber-400 border border-amber-500/30'
                                                             }`}>
                                                             {s}
@@ -1071,16 +1169,23 @@ export default function Dashboard() {
                                             </div>
                                         </td>
                                         <td className="px-6 py-4">
-                                            <span className={`inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-medium ${pos.status === 'In Range' ? 'bg-emerald-500/10 text-emerald-400' :
-                                                pos.status === 'Rebalance Soon' ? 'bg-amber-500/10 text-amber-400' :
-                                                    'bg-rose-500/10 text-rose-400'
-                                                }`}>
-                                                <span className={`w-1.5 h-1.5 rounded-full ${pos.status === 'In Range' ? 'bg-emerald-500 animate-pulse' :
-                                                    pos.status === 'Rebalance Soon' ? 'bg-amber-500' :
-                                                        'bg-rose-500'
-                                                    }`}></span>
-                                                {pos.status}
-                                            </span>
+                                            <div className="flex flex-col gap-1">
+                                                <span className={`inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-medium ${pos.status === 'In Range' ? 'bg-emerald-500/10 text-emerald-400' :
+                                                    pos.status === 'Rebalance Soon' ? 'bg-amber-500/10 text-amber-400' :
+                                                        'bg-rose-500/10 text-rose-400'
+                                                    }`}>
+                                                    <span className={`w-1.5 h-1.5 rounded-full ${pos.status === 'In Range' ? 'bg-emerald-500 animate-pulse' :
+                                                        pos.status === 'Rebalance Soon' ? 'bg-amber-500' :
+                                                            'bg-rose-500'
+                                                        }`}></span>
+                                                    {pos.status}
+                                                </span>
+                                                {pos.marketAlert && (
+                                                    <span className="text-[9px] text-amber-500 font-bold animate-pulse leading-none">
+                                                        ⚠ {pos.marketAlert.replace(/_/g, ' ')}
+                                                    </span>
+                                                )}
+                                            </div>
                                         </td>
                                         <td className="px-6 py-4">
                                             <button

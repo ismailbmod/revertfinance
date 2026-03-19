@@ -86,7 +86,18 @@ export async function GET() {
             allPositions.push(...results.flat());
         }
 
-        return NextResponse.json(allPositions);
+        // Fetch Alert Metadata from Supabase to enrich the status
+        const { data: dbPositions } = await supabase.from('positions').select('nft_id, chain_id, last_alert_type');
+        
+        const enrichedPositions = allPositions.map(pos => {
+            const dbPos = dbPositions?.find(db => db.nft_id === pos.id.split('-')[1] && db.chain_id === pos.chainId);
+            if (dbPos && dbPos.last_alert_type) {
+                return { ...pos, marketAlert: dbPos.last_alert_type };
+            }
+            return pos;
+        });
+
+        return NextResponse.json(enrichedPositions);
     } catch (error: any) {
         console.error('Failed to fetch positions:', error);
         return NextResponse.json({ error: error.message }, { status: 500 });

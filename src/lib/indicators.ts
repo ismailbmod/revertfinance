@@ -89,6 +89,7 @@ export function detectRegime(ema20: number, ema50: number, adx: number): 'trend'
     return 'neutral';
 }
 
+
 export function calculateRSI(prices: number[], period: number): number[] {
     const rsi: number[] = [];
     const gains: number[] = [];
@@ -110,4 +111,12 @@ export function calculateRSI(prices: number[], period: number): number[] {
     }
 
     return rsi;
+}
+
+export function calculateVolumeSpike(volumes: number[], period: number = 14): number {
+    if (volumes.length < period) return 1;
+    const currentVolume = volumes[volumes.length - 1];
+    const prevVolumes = volumes.slice(-period - 1, -1);
+    const avgVolume = prevVolumes.reduce((a, b) => a + b, 0) / period;
+    return avgVolume > 0 ? currentVolume / avgVolume : 1;
 }

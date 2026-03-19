@@ -1,6 +1,6 @@
 import ccxt from 'ccxt';
 import { fetchTopPools, fetchPoolTicks, SubgraphPool } from './subgraph';
-import { calculateATR } from './indicators';
+import { calculateATR, calculateADX, calculateVolumeSpike } from './indicators';
 import { normalizeSymbol } from './bot-engine';
 import { sendNotification } from './telegram';
 import { supabase } from './supabase';
@@ -17,34 +17,40 @@ export interface AlphaSniperResult {
     expectedAPR: number;
     alphaScore: number;
     strategyType: string[];
-    recommendedRanges: {
-        tight: { min: number; max: number };
-        medium: { min: number; max: number };
-        wide: { min: number; max: number };
-    };
+    recommendedRange: { min: number; max: number };
+    rangeWidthPct: number;
     positionShare?: number;
     liquidityDensity?: number;
+    recommendation?: string;
+    confidence?: string;
+    diagnostics?: { atrPct: number; lastADX: number; volumeSpike: number };
 }
 
 export async function runAlphaSniper(chainIds: number[]): Promise<AlphaSniperResult[]> {
     const exchange = new ccxt.binance();
     const allResults: AlphaSniperResult[] = [];
 
-    for (const chainId of chainIds) {
+    const chainTasks = chainIds.map(async (chainId) => {
+        const results: AlphaSniperResult[] = [];
         try {
-            // STEP 1 — Pool Universe (Top 200 per chain)
-            const pools = await fetchTopPools(chainId, 200);
+            console.log(`[Alpha Sniper] Starting scan for chain ${chainId}...`);
+            const pools = await fetchTopPools(chainId, 200, 5000000);
+            console.log(`[Alpha Sniper] Chain ${chainId}: Found ${pools.length} initial pools.`);
 
             for (const pool of pools) {
                 const tvl = parseFloat(pool.totalValueLockedUSD);
-                const vol24h = pool.poolDayData?.[0] ? parseFloat(pool.poolDayData[0].volumeUSD) : 0;
+                
+                // FIXED: Use max of today/yesterday volume (bypass subgraph morning reset)
+                const vol0 = pool.poolDayData?.[0] ? parseFloat(pool.poolDayData[0].volumeUSD) : 0;
+                const vol1 = pool.poolDayData?.[1] ? parseFloat(pool.poolDayData[1].volumeUSD) : 0;
+                const vol24h = Math.max(vol0, vol1);
 
                 // STEP 3 - Alpha Filters (Basic)
-                if (tvl < 1000000) continue;
-                if (vol24h < 2000000) continue;
+                if (tvl < 5000000) continue; 
+                if (vol24h < 1000000) continue; 
 
                 const volumeEfficiency = vol24h / tvl;
-                if (volumeEfficiency <= 0.8) continue;
+                if (volumeEfficiency < 0.1) continue;
 
                 // STEP 2 — Core Alpha Metrics
                 const feeTierDecimal = parseInt(pool.feeTier) / 1000000;
@@ -81,8 +87,8 @@ export async function runAlphaSniper(chainIds: number[]): Promise<AlphaSniperRes
                 // 3) Liquidity Density Near Price (±1.0%)
                 const ticks = await fetchPoolTicks(pool.id, chainId);
                 const rangeFactor = 0.01; // 1%
-                const rangeMin = price * (1 - rangeFactor);
-                const rangeMax = price * (1 + rangeFactor);
+                const filterRangeMin = price * (1 - rangeFactor);
+                const filterRangeMax = price * (1 + rangeFactor);
 
                 let activeLiquidityNearPrice = 0;
                 let totalPoolLiquidity = 0;
@@ -93,7 +99,7 @@ export async function runAlphaSniper(chainIds: number[]): Promise<AlphaSniperRes
 
                     const liqGross = parseFloat(tick.liquidityGross);
                     totalPoolLiquidity += liqGross;
-                    if (tickPrice >= rangeMin && tickPrice <= rangeMax) {
+                    if (tickPrice >= filterRangeMin && tickPrice <= filterRangeMax) {
                         activeLiquidityNearPrice += liqGross;
                     }
                 }
@@ -139,9 +145,6 @@ export async function runAlphaSniper(chainIds: number[]): Promise<AlphaSniperRes
 
                 // Strategy markers
                 const strategyType: string[] = [];
-                if (expectedDailyYield > 0.01) {
-                    strategyType.push("EXTREME ALPHA (VERIFY)");
-                }
 
                 // STEP 4 — Fee Spike Detection
                 const volumes = pool.poolDayData?.map(d => parseFloat(d.volumeUSD)) || [];
@@ -153,6 +156,10 @@ export async function runAlphaSniper(chainIds: number[]): Promise<AlphaSniperRes
 
                 // STEP 6 — Range Generation (ATR)
                 let atr1h = 0;
+                let atrPct = 0;
+                let lastADX = 0;
+                let volumeSpike = 0;
+
                 try {
                     const normalizedSymbol = await normalizeSymbol(exchange, poolSymbol);
                     if (normalizedSymbol) {
@@ -161,40 +168,70 @@ export async function runAlphaSniper(chainIds: number[]): Promise<AlphaSniperRes
                             const closes = ohlcv.map(o => o[4] as number);
                             const highs = ohlcv.map(o => o[2] as number);
                             const lows = ohlcv.map(o => o[3] as number);
+                            const vols = ohlcv.map(o => o[5] as number);
+
                             const atrs = calculateATR(highs, lows, closes, 24);
                             atr1h = atrs[atrs.length - 1];
+                            atrPct = (atr1h / price) * 100;
+
+                            const { adx } = calculateADX(highs, lows, closes, 14);
+                            lastADX = adx[adx.length - 1];
+                            volumeSpike = calculateVolumeSpike(vols, 14);
                         }
                     }
                 } catch (e) { }
 
-                if (atr1h === 0) atr1h = price * 0.01; // fallback 1% ATR
+                // DATA VALIDATION LAYER
+                if (!atr1h || atr1h === 0 || !lastADX || lastADX === 0 || !volumeSpike || volumeSpike === 0 || vol24h === 0) {
+                    continue; // BLOCK signal completely if market data is missing
+                }
 
-                // STABLECOIN PAIR multiplier
-                const atrMult = isStablePair ? 0.5 : 1.0;
+                // 2) OPTIMAL RANGE GENERATION
+                const t0Correlated = ['ETH', 'WETH', 'BTC', 'WBTC', 'MATIC', 'WMATIC'].includes(pool.token0.symbol.toUpperCase());
+                const t1Correlated = ['ETH', 'WETH', 'BTC', 'WBTC', 'MATIC', 'WMATIC'].includes(pool.token1.symbol.toUpperCase());
+                const isCorrelatedPair = t0Correlated && t1Correlated && !isStablePair;
 
-                let tightWidth = 0.75 * atr1h * atrMult;
-                let medWidth = 1.5 * atr1h * atrMult;
-                let wideWidth = 3.0 * atr1h * atrMult;
+                let K = 2.5; // Volatile
+                if (isStablePair) K = 1.5;
+                else if (isCorrelatedPair) K = 2.0;
 
-                // 2) RANGE SANITY VALIDATION & CLAMPING
-                const maxAllowedWidth = 0.5 * price;
-                if (tightWidth > maxAllowedWidth) tightWidth = maxAllowedWidth;
-                if (medWidth > maxAllowedWidth) medWidth = maxAllowedWidth;
-                if (wideWidth > maxAllowedWidth) wideWidth = maxAllowedWidth;
+                let K_ADX_Multiplier = 1.0;
+                if (lastADX > 25) {
+                    K_ADX_Multiplier = 1.25; // increase range by +25%
+                }
 
-                const tightRange = { min: price - tightWidth, max: price + tightWidth };
-                const mediumRange = { min: price - medWidth, max: price + medWidth };
-                const wideRange = { min: price - wideWidth, max: price + wideWidth };
+                let rangeWidthPct = (K * atrPct * K_ADX_Multiplier) / 100;
+                if (rangeWidthPct < 0.015) {
+                    rangeWidthPct = 0.015; // Minimum range width 1.5%
+                }
 
-                // Ensure positive
-                if (tightRange.min <= 0) tightRange.min = price * 0.99;
-                if (mediumRange.min <= 0) mediumRange.min = price * 0.95;
-                if (wideRange.min <= 0) wideRange.min = price * 0.9;
+                const maxAllowedPct = 0.50;
+                if (rangeWidthPct > maxAllowedPct) rangeWidthPct = maxAllowedPct;
 
-                // STEP 7 — Alpha Score
-                let alphaScore = (expectedDailyYield * 100) + (volumeEfficiency * 50);
-                if (feeSpikeFlag) alphaScore += 40;
-                if (liquidityGapFlag) alphaScore += 30;
+                const adjustedRangeWidth = price * rangeWidthPct;
+                let rangeMin = price - (adjustedRangeWidth / 2);
+                let rangeMax = price + (adjustedRangeWidth / 2);
+
+                if (rangeMin <= 0) rangeMin = price * 0.95;
+
+                // YIELD REALISM FILTERS
+                if (volumeSpike < 0.5) expectedDailyYield *= 0.4;
+                if (lastADX > 30) expectedDailyYield *= 0.6;
+                if (atrPct < 0.2) expectedDailyYield *= 0.5;
+
+                let expectedAPR = expectedDailyYield * 365 * 100;
+                if (expectedAPR > 120) {
+                    expectedDailyYield = 1.2 / 365;
+                    expectedAPR = 120;
+                    strategyType.push("Unstable APR");
+                }
+
+                // STEP 7 — Alpha Score (Scale 0-100+)
+                // expectedDailyYield of 0.01 (1%) = 100 points
+                // volumeEfficiency of 1.0 (100%) = 100 points
+                let alphaScore = (expectedDailyYield * 10000) * 0.6 + (volumeEfficiency * 100) * 0.4;
+                if (feeSpikeFlag) alphaScore += 30;
+                if (liquidityGapFlag) alphaScore += 20;
 
                 if (feeSpikeFlag) strategyType.push("Fee Spike");
                 if (liquidityGapFlag) strategyType.push("Liquidity Gap");
@@ -204,9 +241,24 @@ export async function runAlphaSniper(chainIds: number[]): Promise<AlphaSniperRes
                 // 8) FINAL OUTPUT VALIDATION
                 if (price <= 0 || price > 1000000) continue;
                 if (expectedDailyYield <= 0 || expectedDailyYield > 0.02) continue;
-                if (tightRange.max <= tightRange.min) continue;
+                if (rangeMax <= rangeMin) continue;
 
-                allResults.push({
+                // LP Entry Consistency Validation
+                if (lastADX > 35) continue;
+                if (volumeSpike !== 0 && volumeSpike < 0.3) continue;
+                if (expectedAPR < 8) continue;
+                if (alphaScore < 60) {
+                    console.log(`NO TRADE - LOW QUALITY SETUP (${poolSymbol}) - Score: ${alphaScore.toFixed(1)}`);
+                    continue;
+                }
+
+                let recommendation = "MODERATE";
+                if (alphaScore > 75) recommendation = "STRONG OPPORTUNITY";
+
+                if (expectedDailyYield > 0.008) strategyType.push("HIGH RISK");
+                if (expectedDailyYield > 0.01) strategyType.push("EXTREME YIELD - VERIFY DATA");
+
+                results.push({
                     pool: poolSymbol,
                     chainId,
                     poolAddress: pool.id,
@@ -217,12 +269,11 @@ export async function runAlphaSniper(chainIds: number[]): Promise<AlphaSniperRes
                     expectedDailyYield,
                     expectedAPR: expectedDailyYield * 365 * 100,
                     alphaScore,
+                    recommendation,
+                    diagnostics: { atrPct, lastADX, volumeSpike },
                     strategyType: strategyType.length > 0 ? strategyType : ["High Efficiency"],
-                    recommendedRanges: {
-                        tight: tightRange,
-                        medium: mediumRange,
-                        wide: wideRange
-                    },
+                    recommendedRange: { min: rangeMin, max: rangeMax },
+                    rangeWidthPct,
                     positionShare,
                     liquidityDensity
                 });
@@ -230,10 +281,15 @@ export async function runAlphaSniper(chainIds: number[]): Promise<AlphaSniperRes
         } catch (error) {
             console.error(`Alpha Sniper failed for chain ${chainId}:`, error);
         }
-    }
+        return results;
+    });
+
+    const resultsArray = await Promise.all(chainTasks);
+    resultsArray.forEach(r => allResults.push(...r));
 
     // Sort by Alpha Score
-    const sorted = allResults.sort((a, b) => b.alphaScore - a.alphaScore).slice(0, 5);
+    const sorted = allResults.sort((a, b) => b.alphaScore - a.alphaScore).slice(0, 10);
+
 
     // STEP 9 — Alerts (Yield > 0.5%)
     let chatId = undefined;
@@ -246,20 +302,28 @@ export async function runAlphaSniper(chainIds: number[]): Promise<AlphaSniperRes
     const formatPrice = (p: number) => p < 0.01 ? p.toFixed(8) : p.toFixed(4);
 
     for (const res of sorted) {
-        if (res.expectedDailyYield > 0.005 && chatId) {
+        if (res.expectedDailyYield >= 0.002 && chatId) {
             const message = `🚀 *ALPHA SNIPER ALERT*
             
 Pool: \`${res.pool}\`
 Fee Tier: \`${(res.feeTier / 10000).toFixed(2)}%\`
 Chain: \`${getNetworkName(res.chainId)}\`
-Daily Yield: \`${(res.expectedDailyYield * 100).toFixed(2)}%\`
+
+Recommendation: *${res.recommendation}*
+
 Alpha Score: \`${res.alphaScore.toFixed(1)}\`
+Daily Yield: \`${(res.expectedDailyYield * 100).toFixed(2)}%\`
+Estimated APR: \`${res.expectedAPR.toFixed(1)}%\`
 Strategies: \`${res.strategyType.join(', ')}\`
 
-*Recommended Ranges:*
-Tight: \`$${formatPrice(res.recommendedRanges.tight.min)} - $${formatPrice(res.recommendedRanges.tight.max)}\`
-Medium: \`$${formatPrice(res.recommendedRanges.medium.min)} - $${formatPrice(res.recommendedRanges.medium.max)}\`
-Wide: \`$${formatPrice(res.recommendedRanges.wide.min)} - $${formatPrice(res.recommendedRanges.wide.max)}\``;
+Diagnostics:
+ATR: \`${res.diagnostics?.atrPct.toFixed(2)}%\`
+ADX: \`${res.diagnostics?.lastADX.toFixed(1)}\`
+Volume Spike: \`${res.diagnostics?.volumeSpike.toFixed(1)}x\`
+
+*Recommended Range:*
+\`$${formatPrice(res.recommendedRange.min)} - $${formatPrice(res.recommendedRange.max)}\`
+Range Width: \`${(res.rangeWidthPct * 100).toFixed(2)}%\``;
 
             await sendNotification(chatId, message);
         }
