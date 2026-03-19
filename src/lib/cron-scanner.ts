@@ -4,15 +4,15 @@ import { detectHighYieldPools } from './high-yield';
 import { sendNotification } from './telegram';
 import { supabase } from './supabase';
 
-export async function runAutomatedAlphaScan() {
+export async function runAutomatedAlphaScan(singleChain?: number) {
     console.log(`--- [CRON] Starting Automated Alpha Sniper Scan at ${new Date().toLocaleString()} ---`);
     
     const { data: telegramData } = await supabase.from('settings').select('value').eq('key', 'telegram_chat_id').single();
     const chatId = telegramData?.value;
     if (!chatId) return;
 
-    // Scan all main chains
-    const chainIds = [1, 137, 10, 42161, 8453, 56];
+    // Scan all main chains or just one
+    const chainIds = singleChain ? [singleChain] : [1, 137, 10, 42161, 8453, 56];
     
     try {
         const opportunities = await runAlphaSniper(chainIds);
